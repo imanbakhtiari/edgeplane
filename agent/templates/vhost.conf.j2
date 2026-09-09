@@ -1,0 +1,117 @@
+upstream origin_{{ v.id.hex }} {
+{% for origin,ips in addresses[v.id|string] %}{% for ip in ips %}
+    server {{ '['+ip+']' if ':' in ip else ip }}:{{ origin.port }} weight={{ origin.weight }} max_fails={{ origin.max_fails }} fail_timeout={{ origin.fail_timeout }}s{{ ' backup' if origin.backup else '' }};
+{% endfor %}{% endfor %}
+    keepalive {{ v.origins[0].keepalive }};
+}
+server {
+    listen {{ s.public_port }};
+{% if v.tls %}
+    listen {{ s.tls_port }} ssl;
+    ssl_certificate {{ release }}/tls/{{ v.id }}.pem;
+    ssl_certificate_key {{ release }}/tls/{{ v.id }}.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+{% endif %}
+    server_name {{ v.domains|join(' ') }};
+{% if v.analytics.mode != 'off' %}
+    access_log {{ s.log_root }}/metrics/{{ v.id }}.log {{ 'cdn_usage' if v.analytics.geography else 'cdn_usage_plain' }} buffer=64k flush=1s;
+{% endif %}
+{% if v.geo.mode != 'off' %}
+    if ($cdn_geo_deny_{{ v.id.hex }}) { return 403; }
+{% if v.geo.block_unknown %}    if ($cdn_country = ZZ) { return 403; }
+{% endif %}{% endif %}
+{% for rule in v.path_rules %}
+    if ($cdn_path_{{ 'deny' if rule.action == 'allow_ips' else 'match' }}_{{ v.id.hex }}_{{ loop.index }}) { return 403; }
+{% endfor %}
+
+{% for cidr in v.real_ip.trusted_cidrs %}    set_real_ip_from {{ cidr }};
+{% endfor %}
+    real_ip_header {{ v.real_ip.header }};
+    real_ip_recursive {{ 'on' if v.real_ip.recursive else 'off' }};
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+    more_clear_headers "X-CDN-*";
+    more_clear_input_headers "X-CDN-*";
+    client_max_body_size {{ v.max_body_mb }}m;
+    client_body_timeout {{ v.client_timeout }}s;
+    client_header_timeout {{ v.client_timeout }}s;
+{% if v.logging %}
+    access_log {{ s.log_root }}/{{ v.id }}/access.json.log cdn;
+    error_log {{ s.log_root }}/{{ v.id }}/error.log warn;
+{% elif v.analytics.mode == 'off' %}    access_log off;
+{% endif %}
+{% for cidr in v.ip_allow %}    allow {{ cidr }};
+{% endfor %}{% for cidr in v.ip_deny %}    deny {{ cidr }};
+{% endfor %}{% if v.ip_allow %}    deny all;
+{% endif %}
+{% if v.rate.enabled %}
+{% for rule in v.rate.paths %}    limit_req zone=cdn_{{ v.id.hex }}_{{ loop.index }} burst={{ rule.burst }}{{ ' nodelay' if v.rate.nodelay else '' }};
+{% endfor %}
+    limit_req zone=cdn_rate_{{ v.rate.rate }} burst={{ v.rate.burst }}{{ ' nodelay' if v.rate.nodelay else '' }};
+    limit_req_status {{ v.rate.status }};
+    limit_req_dry_run {{ 'on' if v.rate.dry_run else 'off' }};
+{% endif %}
+{% for path in v.blocked_paths %}    location ^~ {{ path }} { return 403; }
+{% endfor %}
+    location / {
+        if ($request_method = PURGE) { return 405; }
+{% if v.allowed_methods %}        if ($request_method !~ ^({{ v.allowed_methods|join('|') }})$) { return 405; }
+{% endif %}
+        # Allowlist prevents ALL client X-CDN-* headers from entering the data plane.
+        proxy_pass_request_headers off;
+{% for h in ['Accept','Accept-Encoding','Accept-Language','Authorization','Cookie','Content-Type','Range','If-Range','If-Modified-Since','If-None-Match','Cache-Control','Pragma','User-Agent','Referer','Origin','Access-Control-Request-Method','Access-Control-Request-Headers'] %}
+        proxy_set_header {{ h }} $http_{{ h|lower|replace('-','_') }};
+{% endfor %}
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Request-ID $request_id;
+        proxy_set_header X-CDN-Vhost {{ v.id }};
+        proxy_set_header X-CDN-Policy {{ cache_ids[v.id|string] }};
+{% if v.websocket %}
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $cdn_connection;
+        proxy_pass $cdn_backend;
+{% else %}
+        proxy_set_header Connection '';
+        proxy_pass http://127.0.0.1:{{ s.varnish_port }};
+{% endif %}
+        proxy_http_version 1.1;
+{% for name,value in v.headers.request.items() %}        proxy_set_header {{ name }} "{{ value }}";
+{% endfor %}
+{% for name,value in v.headers.response.items() %}        add_header {{ name }} "{{ value }}" always;
+{% endfor %}
+{% if v.headers.debug %}
+        add_header X-Served-By "{{ s.agent_id }}" always;
+        add_header X-Request-ID $request_id always;
+{% else %}
+        proxy_hide_header X-Cache;
+        proxy_hide_header X-Cache-Hits;
+        proxy_hide_header Via;
+{% endif %}
+    }
+}
+server {
+    listen 127.0.0.1:{{ s.origin_port }};
+    server_name {{ v.domains|join(' ') }};
+    location / {
+        proxy_pass {{ v.origins[0].scheme }}://origin_{{ v.id.hex }};
+        proxy_http_version 1.1;
+        proxy_set_header Connection $cdn_connection;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Host {{ v.origins[0].host_header or '$host' }};
+        proxy_set_header X-CDN-Vhost '';
+        proxy_set_header X-CDN-Policy '';
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_ssl_server_name on;
+        proxy_ssl_name {{ v.origins[0].sni or v.origins[0].host }};
+        proxy_ssl_verify {{ 'on' if v.origins[0].tls_verify else 'off' }};
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_connect_timeout {{ v.origins[0].connect_timeout }}s;
+        proxy_read_timeout {{ v.origins[0].read_timeout }}s;
+        proxy_send_timeout {{ v.origins[0].send_timeout }}s;
+        proxy_next_upstream error timeout http_502 http_503 http_504;
+        proxy_hide_header X-CDN-Vhost;
+    }
+}

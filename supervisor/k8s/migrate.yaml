@@ -1,0 +1,19 @@
+apiVersion: batch/v1
+kind: Job
+metadata: {name: cdn-migrate-001}
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext: {runAsNonRoot: true, runAsUser: 10001}
+      containers:
+        - name: migrate
+          image: your-registry/cdn-supervisor:0.1.0
+          command: [sh, -c, 'alembic upgrade head && python -m app.seed']
+          envFrom:
+            - configMapRef: {name: cdn-config}
+            - secretRef: {name: cdn-secrets}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: '1', memory: 512Mi}

@@ -1,0 +1,72 @@
+# Managed CDN configuration. Internal ports bind loopback only.
+variables_hash_bucket_size 128;
+variables_hash_max_size 65536;
+map_hash_bucket_size 128;
+map_hash_max_size 65536;
+{% if geo_enabled %}
+geoip2 {{ s.maxmind_city_db }} {
+    auto_reload 5m;
+    $cdn_country default=ZZ source=$remote_addr country iso_code;
+    $cdn_city default=0 source=$remote_addr city geoname_id;
+}
+{% else %}
+map $remote_addr $cdn_country { default ZZ; }
+map $remote_addr $cdn_city { default 0; }
+{% endif %}
+log_format cdn_usage_plain escape=json '{"country":"ZZ","bytes_sent":$bytes_sent,"bytes_received":$request_length,"status":$status,"cache":"$upstream_http_x_cache"}';
+log_format cdn_usage escape=json '{"country":"$cdn_country","bytes_sent":$bytes_sent,"bytes_received":$request_length,"status":$status,"cache":"$upstream_http_x_cache"}';
+map $http_upgrade $cdn_connection { default upgrade; '' close; }
+map $http_upgrade $cdn_backend { default http://127.0.0.1:{{ s.origin_port }}; '' http://127.0.0.1:{{ s.varnish_port }}; }
+log_format cdn escape=json '{"timestamp":"$time_iso8601","request_id":"$request_id","host":"$host","real_client_ip":"$remote_addr","peer_ip":"$realip_remote_addr","method":"$request_method","uri":"$uri","status":$status,"bytes_sent":$bytes_sent,"request_time":$request_time,"upstream_addr":"$upstream_addr","upstream_status":"$upstream_status","cache_status":"$upstream_http_x_cache","rate_limit_status":"$limit_req_status"}';
+server { listen {{ s.public_port }}; server_name _; return 444; }
+server { listen 127.0.0.1:{{ s.origin_port }} default_server; server_name _; return 444; }
+server { listen 127.0.0.1:8081; location = /stub_status { stub_status; } }
+
+{% for v in vhosts %}
+{% if v.rate.enabled %}
+{% if v.rate.key == 'header' %}
+map $http_{{ v.rate.header|lower|replace('-','_') }} $cdn_raw_{{ v.id.hex }} { '' $binary_remote_addr; default $http_{{ v.rate.header|lower|replace('-','_') }}; }
+{% else %}
+map $binary_remote_addr $cdn_raw_{{ v.id.hex }} { default $binary_remote_addr; }
+{% endif %}
+geo $cdn_exempt_{{ v.id.hex }} { default 0; {% for cidr in v.rate.exemptions %}{{ cidr }} 1; {% endfor %} }
+map $cdn_exempt_{{ v.id.hex }} $cdn_key_{{ v.id.hex }} { 1 ''; default "{{ v.id }}:$cdn_raw_{{ v.id.hex }}"; }
+
+{% for rule in v.rate.paths %}
+map $uri $cdn_path_{{ v.id.hex }}_{{ loop.index }} { default ''; ~^{{ rule.path|regex }} $cdn_key_{{ v.id.hex }}; }
+limit_req_zone $cdn_path_{{ v.id.hex }}_{{ loop.index }} zone=cdn_{{ v.id.hex }}_{{ loop.index }}:1m rate={{ rule.rate }}r/s;
+{% endfor %}
+{% endif %}
+{% endfor %}
+
+{% for v in vhosts %}
+{% if v.geo.mode != 'off' %}
+map $cdn_country $cdn_country_match_{{ v.id.hex }} { default 0; {% for country in v.geo.countries %}{{ country }} 1; {% endfor %} }
+map $cdn_city $cdn_city_match_{{ v.id.hex }} { default 0; {% for city in v.geo.city_ids %}{{ city }} 1; {% endfor %} }
+map "$cdn_country_match_{{ v.id.hex }}:$cdn_city_match_{{ v.id.hex }}" $cdn_geo_deny_{{ v.id.hex }} {
+    default {{ 1 if v.geo.mode == 'allow' else 0 }};
+    ~1 {{ 0 if v.geo.mode == 'allow' else 1 }};
+}
+{% endif %}
+{% for rule in v.path_rules %}
+map $uri $cdn_path_match_{{ v.id.hex }}_{{ loop.index }} {
+    default 0;
+    {{ '~^' + (rule.path|regex) if rule.match == 'prefix' else rule.path }} 1;
+}
+{% if rule.action == 'allow_ips' %}
+geo $cdn_path_allowed_{{ v.id.hex }}_{{ loop.index }} { default 0; {% for cidr in rule.cidrs %}{{ cidr }} 1; {% endfor %} }
+map "$cdn_path_match_{{ v.id.hex }}_{{ loop.index }}:$cdn_path_allowed_{{ v.id.hex }}_{{ loop.index }}" $cdn_path_deny_{{ v.id.hex }}_{{ loop.index }} { default 0; "1:0" 1; }
+{% endif %}
+{% endfor %}
+{% endfor %}
+
+# Shared rate zones partition keys by vhost UUID; memory does not grow 10 MB per domain.
+map $host $cdn_rate_global_key {
+    hostnames;
+    default $binary_remote_addr;
+{% for v in vhosts %}{% if v.rate.enabled %}{% for domain in v.domains %}
+    {{ domain }} "$cdn_key_{{ v.id.hex }}";
+{% endfor %}{% endif %}{% endfor %}
+}
+{% for rate in rates %}limit_req_zone $cdn_rate_global_key zone=cdn_rate_{{ rate }}:32m rate={{ rate }}r/s;
+{% endfor %}

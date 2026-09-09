@@ -1,0 +1,20 @@
+name: cdn-agent-lab
+services:
+  agent:
+    build:
+      context: ..
+      dockerfile: agent/Dockerfile
+    environment:
+      AGENT_MODE: sandbox
+      AGENT_ID: sandbox-edge
+      ALLOW_PRIVATE_ORIGINS: 'true'
+    ports: ['127.0.0.1:9443:9443']
+    volumes: [sandbox:/tmp/cdn-sandbox]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://localhost:9443/ready")']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+volumes:
+  sandbox:

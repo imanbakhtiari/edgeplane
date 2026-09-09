@@ -1,0 +1,24 @@
+[Unit]
+Description=CDN node management API (mTLS)
+After=network-online.target nginx.service varnish.service
+Wants=network-online.target
+[Service]
+Type=simple
+# Host adapter needs privileged nginx validation/reload. Root is constrained below;
+# see docs/security.md for the remaining privileged-helper engineering work.
+User=root
+EnvironmentFile=/etc/cdn-agent/agent.env
+WorkingDirectory=/opt/cdn-agent/source
+ExecStart=/opt/cdn-agent/venv/bin/python -m app.main
+Restart=on-failure
+RestartSec=5
+UMask=0027
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/etc/nginx/cdn-managed /etc/varnish/cdn-managed /var/lib/cdn-agent /var/log/nginx /run
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_KILL CAP_SETUID CAP_SETGID
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+[Install]
+WantedBy=multi-user.target

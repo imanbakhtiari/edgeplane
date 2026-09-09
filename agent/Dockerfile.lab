@@ -1,0 +1,10 @@
+# Self-contained lab only: no privileged flag, host networking, or host mounts.
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive AGENT_MODE=sandbox CDN_DATA_PLANE_LAB=true ALLOW_PRIVATE_ORIGINS=true PYTHONUNBUFFERED=1
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv nginx varnish libnginx-mod-http-headers-more-filter libnginx-mod-http-geoip2 prometheus-node-exporter prometheus-nginx-exporter ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/cdn/agent
+COPY agent/ ./
+RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install .
+ENV PATH=/opt/venv/bin:$PATH
+EXPOSE 80 9443
+CMD ["python", "install/lab.py"]

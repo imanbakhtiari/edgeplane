@@ -1,0 +1,36 @@
+# Lab only. Does not manage host NGINX/Varnish. No host mounts or privileges.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: cdn-agent-sandbox}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: cdn-agent-sandbox}
+  template:
+    metadata:
+      labels: {app: cdn-agent-sandbox}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 10002, fsGroup: 10002}
+      containers:
+        - name: agent
+          image: your-registry/cdn-agent:0.1.0
+          env:
+            - {name: AGENT_MODE, value: sandbox}
+          ports: [{containerPort: 9443}]
+          readinessProbe:
+            httpGet: {path: /ready, port: 9443}
+          livenessProbe:
+            httpGet: {path: /health, port: 9443}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: cdn-agent-sandbox}
+spec:
+  selector: {app: cdn-agent-sandbox}
+  ports: [{port: 9443, targetPort: 9443}]

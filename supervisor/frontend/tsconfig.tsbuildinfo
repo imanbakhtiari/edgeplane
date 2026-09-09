@@ -1,0 +1,1 @@
+{"root":["./src/api.ts","./src/main.tsx","./src/components/ui.tsx","./src/pages/DNSSettings.tsx","./src/pages/Monitoring.tsx","./src/pages/Preferences.tsx","./src/pages/Traffic.tsx","./src/pages/Users.tsx","./src/pages/VhostSecurity.tsx"],"version":"5.9.3"}

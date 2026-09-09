@@ -1,0 +1,60 @@
+vcl 4.1;
+import std;
+backend default { .host = "127.0.0.1"; .port = "8080"; }
+acl local { "127.0.0.1"; "::1"; }
+sub vcl_recv {
+    if (client.ip !~ local) { return (synth(403)); }
+    if (req.method == "PURGE") { return (synth(405)); }
+    if (req.method != "GET" && req.method != "HEAD") { return (pass); }
+    if (req.http.Authorization || req.http.Cookie || req.http.Upgrade || req.http.Cache-Control ~ "(?i)(no-cache|no-store)" || req.http.Pragma ~ "(?i)no-cache") { return (pass); }
+
+    if (req.http.X-CDN-Policy == "fa6a05fb4d2c7491") {
+
+
+
+
+
+    }
+
+    return (hash);
+}
+sub vcl_hash {
+    hash_data(req.url);
+    hash_data(req.http.host);
+    hash_data(req.http.X-CDN-Vhost);
+    hash_data(req.http.X-CDN-Policy);
+    return (lookup);
+}
+sub vcl_backend_response {
+    set beresp.http.X-CDN-Host = bereq.http.host;
+    set beresp.http.X-CDN-URL = bereq.url;
+    set beresp.http.X-CDN-Vhost = bereq.http.X-CDN-Vhost;
+    if (bereq.uncacheable || beresp.http.Set-Cookie || beresp.http.Cache-Control ~ "(?i)(private|no-store|no-cache)") {
+        set beresp.uncacheable = true;
+        set beresp.ttl = 0s;
+        return (deliver);
+    }
+
+    if (bereq.http.X-CDN-Policy == "fa6a05fb4d2c7491") {
+        if (beresp.status != 200 && beresp.status != 203 && beresp.status != 301 && beresp.status != 404) {
+            set beresp.uncacheable = true; set beresp.ttl = 0s; return (deliver);
+        }
+        if (!beresp.http.Cache-Control && !beresp.http.Expires) {
+            set beresp.ttl = 120s;
+            if (bereq.url ~ "(?i)\.(css|js|jpg|jpeg|png|gif|webp|avif|svg|ico|woff|woff2|ttf|eot|mp4|webm|pdf|zip)(\?|$)") { set beresp.ttl = 3600s; }
+        }
+        if (beresp.ttl > 86400s) { set beresp.ttl = 86400s; }
+        set beresp.grace = 300s;
+        set beresp.keep = 60s;
+    }
+
+}
+sub vcl_deliver {
+    set resp.http.X-Cache = "MISS";
+    if (obj.hits > 0) { set resp.http.X-Cache = "HIT"; }
+    if (req.is_hitpass || req.is_hitmiss || obj.uncacheable) { set resp.http.X-Cache = "PASS"; }
+    set resp.http.X-Cache-Hits = obj.hits;
+    unset resp.http.X-CDN-Host;
+    unset resp.http.X-CDN-URL;
+    unset resp.http.X-CDN-Vhost;
+}

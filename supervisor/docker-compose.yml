@@ -1,0 +1,76 @@
+name: cdn
+x-supervisor: &supervisor
+  build:
+    context: ..
+    dockerfile: supervisor/Dockerfile
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql+asyncpg://cdn:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/cdn
+    ENVIRONMENT: development
+    SUPERVISOR_PUBLIC_URL: http://localhost:8000
+  networks: [control]
+  restart: unless-stopped
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: cdn
+      POSTGRES_USER: cdn
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes: [postgres:/var/lib/postgresql/data]
+    networks: [control]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U cdn -d cdn']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  migrate:
+    <<: *supervisor
+    command: [sh, -c, 'alembic upgrade head && python -m app.seed']
+    restart: 'no'
+    depends_on:
+      postgres: {condition: service_healthy}
+  supervisor:
+    <<: *supervisor
+    ports: ['127.0.0.1:8000:8000']
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://localhost:8000/ready")']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+  worker:
+    <<: *supervisor
+    command: [python, -m, app.workers.runner]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+  sandbox-agent:
+    build:
+      context: ..
+      dockerfile: agent/Dockerfile
+    environment:
+      AGENT_MODE: sandbox
+      AGENT_NAME: sandbox-edge
+      AGENT_ID: sandbox-edge
+      ALLOW_PRIVATE_ORIGINS: 'true'
+    networks: [control]
+    volumes: [sandbox:/tmp/cdn-sandbox]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://localhost:9443/ready")']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+  demo-origin:
+    image: python:3.12-slim-bookworm
+    command: [python, -m, http.server, '8088']
+    working_dir: /tmp
+    networks: [control]
+    restart: unless-stopped
+volumes:
+  postgres:
+  sandbox:
+networks:
+  control:

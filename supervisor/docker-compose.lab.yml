@@ -1,0 +1,14 @@
+# docker compose -f docker-compose.yml -f docker-compose.lab.yml up --build -d
+services:
+  sandbox-agent:
+    build:
+      context: ..
+      dockerfile: agent/Dockerfile.lab
+    ports: ['127.0.0.1:8080:80']
+    volumes:
+      - lab-sandbox:/tmp/cdn-sandbox
+      - ./maxmind:/etc/cdn-agent/geoip:ro
+    environment:
+      MAXMIND_CITY_DB: /etc/cdn-agent/geoip/GeoLite2-City.mmdb
+volumes:
+  lab-sandbox:
