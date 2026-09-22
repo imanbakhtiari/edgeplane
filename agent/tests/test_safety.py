@@ -206,7 +206,13 @@ async def test_log_and_purge_endpoints_reject_unknown_or_invalid_vhost(monkeypat
 async def test_renderer_golden_snapshot():
     from app.renderers.config import render
 
-    s = Settings(agent_mode="host", agent_id="edge-golden", allow_private_origins=True)
+    s = Settings(
+        agent_mode="host",
+        agent_id="edge-golden",
+        allow_private_origins=True,
+        public_port=80,
+        tls_port=443,
+    )
     v = Vhost(
         id="00000000-0000-0000-0000-000000000001",
         name="Golden",

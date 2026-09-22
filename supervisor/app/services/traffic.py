@@ -24,14 +24,34 @@ async def ingest(db, node_id, snapshot):
         {"key": int.from_bytes(node_id.bytes[-8:], "big", signed=True)},
     )
     epoch = snapshot["epoch"]
+    from uuid import UUID
+
+    incoming_ids = set()
+    for item in snapshot.get("items", []):
+        try:
+            incoming_ids.add(UUID(item["vhost_id"]))
+        except (ValueError, TypeError, KeyError):
+            continue
     previous = {
         (row.vhost_id, row.country): row
         for row in (
-            await db.scalars(select(m.TrafficCounter).where(m.TrafficCounter.agent_id == node_id))
+            await db.scalars(
+                select(m.TrafficCounter).where(
+                    m.TrafficCounter.agent_id == node_id,
+                    m.TrafficCounter.vhost_id.in_(incoming_ids),
+                )
+            )
         ).all()
     }
-    valid = set((await db.scalars(select(m.Vhost.id))).all())
-    from uuid import UUID
+    valid = set(
+        (
+            await db.scalars(
+                select(m.Vhost.id).where(
+                    m.Vhost.id.in_(incoming_ids), m.Vhost.deleted_at.is_(None)
+                )
+            )
+        ).all()
+    )
 
     now = datetime.now(timezone.utc)
     hour = now.replace(minute=0, second=0, microsecond=0)
@@ -120,6 +140,18 @@ async def usage(db, vhost_id=None, customer_id=None, hours=24):
             )
         ).mappings()
     ]
+    agents = [
+        dict(row)
+        for row in (
+            await db.execute(
+                select(m.TrafficBucket.agent_id, m.TrafficBucket.country, *sums)
+                .where(m.TrafficBucket.hour >= window, *filters)
+                .group_by(m.TrafficBucket.agent_id, m.TrafficBucket.country)
+                .order_by(func.sum(m.TrafficBucket.bytes_sent).desc())
+                .limit(1000)
+            )
+        ).mappings()
+    ]
     lifetime_filters = []
     if vhost_id:
         lifetime_filters.append(m.TrafficCounter.vhost_id == vhost_id)
@@ -150,5 +182,6 @@ async def usage(db, vhost_id=None, customer_id=None, hours=24):
         "lifetime": lifetime,
         "series": series,
         "countries": countries,
+        "agents": agents,
         "note": "Observed aggregate usage; hours represent collection time. ZZ means unavailable or disabled geography.",
     }

@@ -1,0 +1,45 @@
+/* The sidebar is fixed and is therefore outside flex layout. Reserve its width
+   so routed pages fill the visible workspace without extending underneath it. */
+.main {
+  width: calc(100% - 234px);
+}
+
+.collapsed .main {
+  width: calc(100% - 74px);
+}
+
+@media (max-width: 1050px) {
+  .main { width: calc(100% - 190px); }
+  .collapsed .main { width: calc(100% - 74px); }
+}
+
+@media (max-width: 720px) {
+  .main, .collapsed .main { width: calc(100% - 61px); }
+}
+
+/* The mounted Supervisor identity is used when no pasted key is supplied. For
+   non-root accounts the SSH password is also offered to sudo. */
+.formbody > .notice:first-child::after {
+  content: " \00b7 From Docker use host.docker.internal, include https:// in the management URL, and enter a numeric public IP. Dedicated Supervisor SSH key and password-based sudo are supported.";
+}
+
+/* Long cache/rate forms must always retain their primary action. */
+.modal footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  background: var(--surface);
+}
+
+button.danger { background: #a94747; border-color: #a94747; color: #fff; }
+button.danger:hover { background: #913b3b; }
+.confirm-body { padding: 28px; display: flex; gap: 17px; align-items: flex-start; }
+.confirm-body > svg { color: #a65b53; flex: none; }
+.confirm-body h3 { margin: 1px 0 8px; }
+.confirm-body p { margin: 0; }
+.node-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 18px 0; }
+.node-summary > div { background: var(--surface-soft); border: 1px solid var(--line); border-radius: 8px; padding: 13px; }
+.node-summary small { display: block; margin-bottom: 7px; }
+.node-summary strong { font-size: 13px; }
+.operator-error { position: fixed; right: 24px; bottom: 24px; z-index: 100; max-width: 460px; box-shadow: 0 12px 40px #0003; }
+@media (max-width: 720px) { .node-summary { grid-template-columns: 1fr; } }

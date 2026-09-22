@@ -63,8 +63,10 @@ server {
         proxy_set_header {{ h }} $http_{{ h|lower|replace('-','_') }};
 {% endfor %}
         proxy_set_header Host $host;
+{% if v.real_ip.forward_to_origin %}
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
+{% endif %}
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Request-ID $request_id;
         proxy_set_header X-CDN-Vhost {{ v.id }};

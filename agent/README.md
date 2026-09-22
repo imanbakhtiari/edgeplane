@@ -4,16 +4,32 @@ Stateless FastAPI node management. No SQLAlchemy, PostgreSQL, SQLite or Redis
 runtime dependency. Persistent local files are generated configuration releases,
 logs, and small applied-state / recovery metadata files.
 
-## Safe simulation
+## Complete local Docker edge
 
 ```bash
 cd agent
 docker compose up --build -d
 curl http://localhost:9443/health
 curl http://localhost:9443/api/v1/status
+curl http://localhost:9091/-/ready
 ```
 
-Or use an isolated Python environment:
+This container runs the same Agent configuration and activation code against real
+container-local NGINX and Varnish processes. It also runs Prometheus, Node Exporter,
+NGINX Exporter and Varnish Exporter. Docker uses host networking, removing bridge
+NAT from the traffic path. The local defaults are 8080 for customer HTTP, 8443 for
+customer TLS, 9443 for management and loopback-only 9091 for POP Prometheus. Real
+POPs normally use 80/443. Persistent configuration, cache metadata and metrics are
+kept in the `edge-data` volume.
+
+`MANAGEMENT_ALLOWED_CIDRS` is a JSON list in `agent/.env`. Keep only loopback, the
+Supervisor Docker subnet, and explicitly approved operations addresses. The Agent
+checks the socket peer and ignores forwarded headers for this decision. Container
+mode does not receive `NET_ADMIN` and therefore cannot rewrite the host's global
+firewall. Real host-mode provisioning can configure UFW with `firewall=true` and
+the same explicit management CIDRs while preserving SSH and public 80/443.
+
+The `sandbox` mode remains available only for isolated unit development:
 
 ```bash
 python3 -m venv .venv
@@ -21,13 +37,12 @@ python3 -m venv .venv
 AGENT_MODE=sandbox ALLOW_PRIVATE_ORIGINS=true .venv/bin/python -m app.main
 ```
 
-Sandbox service results are explicitly labeled simulated. It never invokes host
-NGINX, Varnish or systemctl. The separate `Dockerfile.lab` opts into real services
-inside its own container only; it uses no host network or host filesystem mounts.
+Sandbox service results are explicitly labeled simulated and never invoke NGINX,
+Varnish or systemctl. Do not register a sandbox process as a POP.
 
 ## Host mode
 
-Use Supervisor's approved SSH bootstrap against Ubuntu 24.04. The installer
+Use Supervisor's approved SSH bootstrap against Ubuntu 22.04 or 24.04. The installer
 creates a constrained systemd service, installs NGINX/Varnish and exporters,
 generates controlled includes with backup/validation, and installs a unique mTLS
 identity issued by Supervisor. Start with `python -m app.main`; loading the ASGI

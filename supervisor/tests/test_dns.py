@@ -1,6 +1,6 @@
 from unittest.mock import AsyncMock, patch
 from types import SimpleNamespace
-from app.services.dns import reconcile
+from app.services.dns import reconcile, record_name, record_values
 from app.core.settings import settings
 
 
@@ -35,3 +35,15 @@ async def test_dns_only_eligible_nodes_and_replace_not_duplicate():
     assert rrsets[0]["records"] == [{"content": "192.0.2.10", "disabled": False}]
     assert rrsets[1]["changetype"] == "DELETE"
     assert all(row.status == "SUCCESS" for row in added)
+
+
+def test_operator_records_are_bounded_to_managed_zone():
+    config = {"zone": "edge.example.net"}
+    assert record_name(config, "status") == "status.edge.example.net."
+    assert record_name(config, "@") == "edge.example.net."
+    try:
+        record_name(config, "outside.example.org")
+        assert False, "out-of-zone record accepted"
+    except ValueError:
+        pass
+    assert record_values("A", ["192.0.2.1"]) == ("A", ["192.0.2.1"])

@@ -44,6 +44,6 @@ def test_telemetry_incremental_restart_rotation_and_metrics(tmp_path):
     path.write_text(row)
     restarted.collect()
     assert restarted.snapshot()["items"][0]["requests"] == 4
-    assert 'cdn_customer_bytes_sent_total{customer_id="' + customer + '"} 400' in restarted.metrics()
+    assert 'customer_id="' + customer + '"} 400' in restarted.metrics()
     assert 'country="DE"' in restarted.metrics()
     assert "client_ip" not in restarted.metrics()

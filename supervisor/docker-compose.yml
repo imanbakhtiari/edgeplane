@@ -6,9 +6,15 @@ x-supervisor: &supervisor
   env_file: .env
   environment:
     DATABASE_URL: postgresql+asyncpg://cdn:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/cdn
-    ENVIRONMENT: development
-    SUPERVISOR_PUBLIC_URL: http://localhost:8000
+    ENVIRONMENT: ${ENVIRONMENT:-production}
+    SUPERVISOR_PUBLIC_URL: ${SUPERVISOR_PUBLIC_URL:-https://localhost:8000}
   networks: [control]
+  # Match the host group that owns the read-only 0640 SSH private key.
+  group_add: ['${SUPERVISOR_SSH_KEY_GID:-1000}']
+  volumes:
+    - ./ssh_keys/edgeplane_ed25519:/run/secrets/edgeplane_ssh_key:ro
+  extra_hosts:
+    - host.docker.internal:host-gateway
   restart: unless-stopped
 services:
   postgres:
@@ -46,31 +52,21 @@ services:
     command: [python, -m, app.workers.runner]
     depends_on:
       migrate: {condition: service_completed_successfully}
-  sandbox-agent:
-    build:
-      context: ..
-      dockerfile: agent/Dockerfile
-    environment:
-      AGENT_MODE: sandbox
-      AGENT_NAME: sandbox-edge
-      AGENT_ID: sandbox-edge
-      ALLOW_PRIVATE_ORIGINS: 'true'
-    networks: [control]
-    volumes: [sandbox:/tmp/cdn-sandbox]
-    restart: unless-stopped
-    healthcheck:
-      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://localhost:9443/ready")']
-      interval: 10s
-      timeout: 3s
-      retries: 5
-  demo-origin:
-    image: python:3.12-slim-bookworm
-    command: [python, -m, http.server, '8088']
-    working_dir: /tmp
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-remote-write-receiver
+    ports: ['127.0.0.1:9090:9090']
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus:/prometheus
     networks: [control]
     restart: unless-stopped
 volumes:
   postgres:
-  sandbox:
+  prometheus:
 networks:
   control:

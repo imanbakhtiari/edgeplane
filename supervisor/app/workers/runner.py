@@ -8,6 +8,7 @@ another worker can reclaim RUNNING targets without overlapping activation.
 import asyncio
 import json
 import logging
+import httpx
 from datetime import datetime, timezone
 from sqlalchemy import select, text
 from app.db.session import Session, engine
@@ -19,6 +20,37 @@ from app.services.agents import request_agent
 
 log = logging.getLogger("cdn.worker")
 
+SAFE_FAILURES = {
+    "SSH_CREDENTIAL_MISSING": "SSH credentials are missing. Edit the node and save bootstrap credentials.",
+    "SSH_HOST_KEY_APPROVAL_REQUIRED": "SSH host identity is not approved. Discover and approve the fingerprint before provisioning.",
+    "UBUNTU_20_HOST_BOOTSTRAP_UNAVAILABLE": "Ubuntu 20.04 detected. Host provisioning needs NGINX GeoIP2 and NGINX exporter packages unavailable in its standard repositories; use Ubuntu 22.04 or 24.04. No packages were changed.",
+    "UNSUPPORTED_NODE_OS": "Only Ubuntu nodes are supported by this host provisioner. No packages were changed.",
+    "UNSUPPORTED_UBUNTU_RELEASE": "Only Ubuntu 22.04 and 24.04 are supported by this host provisioner. No packages were changed.",
+    "NODE_PYTHON_TOO_OLD": "Node Python must be 3.10 or newer. Install a supported Python runtime before reprovisioning. No packages were changed.",
+    "AGENT_PACKAGE_MISSING": "The production Agent package is missing on the Supervisor worker.",
+    "BOOTSTRAP_FAILED": "The remote production-Agent bootstrap command failed.",
+    "SUPERVISOR_EGRESS_IP_UNAVAILABLE": "The remote SSH session did not report the Supervisor source IP. Check SSH_CONNECTION on the POP, then configure AGENT_MANAGEMENT_ALLOWED_CIDRS.",
+    "AGENT_SCHEMA_UNSUPPORTED": "The Agent does not support this Supervisor configuration schema.",
+    "AGENT_REVISION_HASH_MISMATCH": "The Agent returned a different configuration revision or hash.",
+}
+
+
+def safe_failure(exc):
+    value = str(exc)
+    if value in SAFE_FAILURES:
+        return value, SAFE_FAILURES[value]
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 403:
+            return "AGENT_MANAGEMENT_DENIED", "Agent rejected the Supervisor source IP (HTTP 403). Reprovision to refresh its management allowlist, or add the Supervisor egress CIDR to AGENT_MANAGEMENT_ALLOWED_CIDRS."
+        return "AGENT_HTTP_ERROR", f"Agent management API returned HTTP {status}. Check the Agent service journal."
+    name = type(exc).__name__
+    if name == "ConnectError":
+        return "AGENT_API_UNREACHABLE", "Cannot connect to the Agent management API. Provision it first, then check port 9443, TLS, and the firewall allowlist."
+    if name in {"ConnectionLost", "ConnectionRefusedError", "HostKeyNotVerifiable", "PermissionDenied"}:
+        return "SSH_CONNECTION_FAILED", "SSH connection or authentication failed. Run Test SSH & sudo and check the SSH host, port, credentials, approved fingerprint, and firewall."
+    return name, "Operation failed. Run the relevant connectivity test and inspect the provisioning steps below."
+
 
 def lock_key(id):
     return int.from_bytes(id.bytes[:8], "big", signed=True) if id else 7391044
@@ -27,6 +59,10 @@ def lock_key(id):
 async def event(job_id, target_id, message, level="INFO"):
     async with Session.begin() as db:
         db.add(m.JobEvent(job_id=job_id, target_id=target_id, message=message[:8192], level=level))
+        if target_id:
+            target = await db.get(m.JobTarget, target_id)
+            if target and target.agent_id:
+                db.add(m.AgentActivity(agent_id=target.agent_id, stage="job", status=level, message=message[:8192]))
 
 
 async def claim(connection):
@@ -148,16 +184,20 @@ async def work_once():
                 await perform(target_id)
             except Exception as exc:
                 # SSH/HTTP exception strings may include credentials; persist typed error only.
-                code = type(exc).__name__
+                code, message = safe_failure(exc)
                 async with Session.begin() as db:
                     target = await db.get(m.JobTarget, target_id)
                     target.status = "FAILED"
                     target.result = {
                         "error": code,
-                        "message": "Operation failed. See step events and node connectivity.",
+                        "message": message,
                     }
+                    node = await db.get(m.AgentNode, target.agent_id) if target.agent_id else None
+                    if node:
+                        node.status = "FAILED"
                     job_id = target.job_id
-                await event(job_id, target_id, "Operation failed: " + code, "ERROR")
+                log.error("job failed job_id=%s target_id=%s error=%s", job_id, target_id, code)
+                await event(job_id, target_id, message, "ERROR")
             await finish_job(target_id)
         finally:
             await connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})

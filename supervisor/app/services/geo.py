@@ -8,9 +8,9 @@ from app.core.settings import settings
 def reader():
     import maxminddb
 
-    if not Path(settings.maxmind_city_db).is_file():
+    if not Path(settings.maxmind_country_db).is_file():
         raise HTTPException(503, "MAXMIND_DATABASE_MISSING")
-    return maxminddb.open_database(settings.maxmind_city_db)
+    return maxminddb.open_database(settings.maxmind_country_db)
 
 
 def lookup(ip):

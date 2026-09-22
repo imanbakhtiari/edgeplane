@@ -5,6 +5,15 @@ Its A/AAAA RRsets contain eligible active edges with public IP addresses. The ma
 zone must already exist in your authoritative PowerDNS installation. Customer zones
 are never edited by this integration.
 
+The DNS page reads live RRsets from PowerDNS and permits validated A, AAAA, CNAME,
+TXT, CAA, MX, NS and SRV replacement or deletion inside that managed zone.
+Edgeplane-generated vhost RRsets are shown separately because automatic POP
+reconciliation may replace manual edits to those names.
+
+With no anycast setting, generated vhost names publish all healthy POP unicast
+addresses. With `DNS_ANYCAST_IPV4` or `DNS_ANYCAST_IPV6`, they publish shared service
+addresses which must be announced from each POP by the operator's BGP system.
+
 Configure API URL/key, server ID, managed zone and TTL using deployment environment
 or `PUT /api/v1/settings/dns`. API-configured secrets are encrypted in PostgreSQL.
 The database configuration takes precedence. Reconciliation uses RRset REPLACE/DELETE,

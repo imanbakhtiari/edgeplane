@@ -9,3 +9,6 @@ dist/
 *.egg-info/
 .coverage
 .runtime/
+supervisor/ssh_keys/edgeplane_ed25519
+supervisor/.env
+agent/.env

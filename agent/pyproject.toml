@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cdn-agent"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.34,<1", "pydantic-settings>=2.7,<3", "httpx>=0.28,<1", "cryptography>=44", "jinja2>=3.1,<4", "psutil>=6"]
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.25", "ruff>=0.9"]

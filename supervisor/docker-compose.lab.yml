@@ -1,14 +1,27 @@
-# docker compose -f docker-compose.yml -f docker-compose.lab.yml up --build -d
+# Local full edge data plane. Despite this legacy overlay filename, configuration
+# operations execute real NGINX and Varnish commands; this is not a simulation.
 services:
-  sandbox-agent:
+  edge-agent:
     build:
       context: ..
-      dockerfile: agent/Dockerfile.lab
-    ports: ['127.0.0.1:8080:80']
+      dockerfile: agent/Dockerfile.edge
+    network_mode: host
     volumes:
-      - lab-sandbox:/tmp/cdn-sandbox
+      - edge-data:/tmp/cdn-sandbox
       - ./maxmind:/etc/cdn-agent/geoip:ro
     environment:
+      AGENT_MODE: container
+      AGENT_ID: local-edge
+      AGENT_NAME: local-edge
+      MANAGEMENT_ALLOWED_CIDRS: ${AGENT_MANAGEMENT_ALLOWED_CIDRS:-["127.0.0.0/8","::1/128","172.24.0.0/16"]}
+      POP_PROMETHEUS_PORT: ${AGENT_PROMETHEUS_PORT:-9091}
+      VARNISH_CACHE_SIZE: ${AGENT_VARNISH_CACHE_SIZE:-1g}
+      PUBLIC_PORT: ${AGENT_PUBLIC_PORT:-8080}
+      TLS_PORT: ${AGENT_TLS_PORT:-8443}
       MAXMIND_CITY_DB: /etc/cdn-agent/geoip/GeoLite2-City.mmdb
+      MAXMIND_COUNTRY_DB: /etc/cdn-agent/geoip/GeoLite2-Country.mmdb
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    restart: unless-stopped
 volumes:
-  lab-sandbox:
+  edge-data:

@@ -8,6 +8,22 @@ from app.models.entities import User, LoginSession, APIToken
 from app.core.security import passwords, token_hash
 from app.core.settings import settings
 
+SECTIONS = {
+    "dashboard", "monitoring", "traffic", "customers", "topology", "nodes", "vhosts",
+    "cache-policies", "rate-limit-policies", "real-ip-policies", "header-policies",
+    "certificates", "dns", "jobs", "logs", "routing-health", "audit", "users", "settings", "preferences",
+}
+ROLE_SECTIONS = {
+    "ADMIN": SECTIONS,
+    "OPERATOR": SECTIONS - {"users", "settings", "dns"},
+    "VIEWER": {"dashboard", "monitoring", "traffic", "customers", "topology", "nodes", "vhosts", "jobs", "logs", "routing-health", "preferences"},
+}
+
+
+def effective_sections(user):
+    configured = set(user.section_permissions or [])
+    return sorted((configured if configured else ROLE_SECTIONS.get(user.role, set())) & SECTIONS)
+
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
@@ -111,6 +127,22 @@ async def current_user(request: Request, db=Depends(session)):
     return user
 
 
+async def section_access(request: Request, user=Depends(current_user)):
+    relative = request.url.path.removeprefix("/api/v1/")
+    part = relative.split("/", 1)[0]
+    aliases = {"agents": "nodes", "sync": "nodes", "config-revisions": "settings", "geo": "traffic"}
+    section = aliases.get(part, part if part in SECTIONS else None)
+    if relative == "settings/dns" or relative.startswith("dns/"):
+        section = "dns"
+    elif relative == "settings/analytics" or "/traffic" in relative:
+        section = "traffic"
+    elif relative.endswith("/logs"):
+        section = "logs"
+    if section and section not in effective_sections(user):
+        raise HTTPException(403, f"Section access denied: {section}")
+    return user
+
+
 def role(*roles):
     async def check(user=Depends(current_user)):
         if user.role not in roles:
@@ -158,6 +190,7 @@ async def login(body: Login, request: Request, response: Response, db=Depends(se
         "preferences": user.preferences,
         "username": user.username,
         "role": user.role,
+        "section_permissions": effective_sections(user),
         "must_change_password": user.must_change_password,
     }
 
@@ -174,6 +207,7 @@ async def me(request: Request, user=Depends(current_user), db=Depends(session)):
     return {
         "username": user.username,
         "role": user.role,
+        "section_permissions": effective_sections(user),
         "csrf": row.csrf if row else None,
         "id": str(user.id),
         "preferences": user.preferences,

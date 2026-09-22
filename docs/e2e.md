@@ -1,15 +1,15 @@
-# End-to-end development demo
+# End-to-end local edge flow
 
 ```bash
 python3 tools/dev_env.py  # skip if .env already exists
 cd supervisor
 docker compose -f docker-compose.yml -f docker-compose.lab.yml up --build -d
-docker compose exec supervisor python -m app.seed_demo
 ```
 
-Open http://localhost:8000, use the locally generated admin password, replace it on
-first login. Jobs show the complete snapshot sent to `sandbox-edge`. The five city
-nodes are DEMO records. Wait for the real sandbox target to report SUCCESS.
+Open http://localhost:8000, use the locally generated admin password, and replace it
+on first login. Register `local-edge` with management URL `http://edge-agent:9443`
+from the Compose network. Create a real customer and vhost in the UI, then wait for
+the target to report SUCCESS. No demo data is seeded.
 
 ```bash
 curl -si -H 'Host: demo.example.com' http://localhost:8080/
@@ -35,5 +35,6 @@ Varnish on temporary high-port listeners and proves cache, purge, headers and ra
 behavior without changing the host's production services. Additional TLS/Range/
 WebSocket and real-host acceptance items are tracked in `acceptance.md`.
 
-The lab runs services only inside its own container, with no privileged Docker flag,
-no host mounts and no host network. It is not a production edge deployment method.
+The local edge runs real services inside its own container, with no privileged Docker
+flag, host mounts or host network. Internet-facing POPs use the systemd host installer
+and mTLS described in `agent-provisioning.md`.

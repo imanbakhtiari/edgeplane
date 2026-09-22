@@ -7,14 +7,14 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import Field
 from sqlalchemy import select, delete
-from app.api.auth import current_user, role
+from app.api.auth import current_user, role, section_access
 from app.api.resources import get, output, audit
 from app.core.security import token_hash, passwords
 from app.db.session import session
 from app.models import entities as m
 from app.schemas.config import Model
 
-router = APIRouter(tags=["Operations"], dependencies=[Depends(current_user)])
+router = APIRouter(tags=["Operations"], dependencies=[Depends(section_access)])
 admin = role("ADMIN")
 writer = role("ADMIN", "OPERATOR")
 
@@ -202,6 +202,52 @@ async def refresh(user=Depends(writer), db=Depends(session)):
     return output(await enqueue(db, "POLL", node_ids=[None], user_id=user.id))
 
 
+@router.get("/routing-health")
+async def routing_health(db=Depends(session)):
+    nodes = (
+        await db.scalars(
+            select(m.AgentNode).where(m.AgentNode.active.is_(True), m.AgentNode.demo.is_(False))
+        )
+    ).all()
+    latest_health = {
+        row.agent_id: row
+        for row in (
+            await db.scalars(
+                select(m.AgentHealthHistory)
+                .distinct(m.AgentHealthHistory.agent_id)
+                .order_by(m.AgentHealthHistory.agent_id, m.AgentHealthHistory.created_at.desc())
+            )
+        ).all()
+    }
+    result = []
+    for node in nodes:
+        health = latest_health.get(node.id)
+        observed = health.observed if health else {}
+        routing = observed.get("routing", {})
+        services = observed.get("services", {})
+        result.append(
+            {
+                "id": node.id,
+                "name": node.name,
+                "is_default": "BGP enabled" if routing.get("enabled") else "BGP disabled",
+                "config": {
+                    "city": node.city,
+                    "agent": services.get("cdn-agent", {}).get("active"),
+                    "nginx": services.get("nginx", {}).get("active"),
+                    "varnish": services.get("varnish", {}).get("active"),
+                    "node_exporter": services.get("prometheus-node-exporter", {}).get("active"),
+                    "nginx_exporter": services.get("prometheus-nginx-exporter", {}).get("active"),
+                    "prometheus": services.get("prometheus", {}).get("active"),
+                    "bird": routing.get("service_active"),
+                    "bgp_sessions_established": routing.get("established", 0),
+                    "protocols": routing.get("protocols", []),
+                    "last_seen": node.last_seen,
+                },
+            }
+        )
+    return result
+
+
 @router.get("/settings/dns")
 async def dns_settings(user=Depends(admin), db=Depends(session)):
     from app.services.dns import dns_config
@@ -227,10 +273,10 @@ async def geo_status():
     from pathlib import Path
     from app.core.settings import settings
 
-    path = Path(settings.maxmind_city_db)
+    path = Path(settings.maxmind_country_db)
     return {
         "available": path.is_file(),
-        "database": "GeoLite2-City",
+        "database": "GeoLite2-Country",
         "bytes": path.stat().st_size if path.is_file() else 0,
     }
 

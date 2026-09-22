@@ -3,14 +3,14 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import select, func, BigInteger
 from fastapi.responses import Response
-from app.api.auth import current_user, role
+from app.api.auth import current_user, role, section_access
 from app.api.resources import get, audit
 from app.db.session import session
 from app.models import entities as m
 from app.schemas.config import Model
 from app.services.traffic import usage, collection_mode
 
-router = APIRouter(tags=["Traffic analytics"], dependencies=[Depends(current_user)])
+router = APIRouter(tags=["Traffic analytics"], dependencies=[Depends(section_access)])
 
 
 @router.get("/traffic")

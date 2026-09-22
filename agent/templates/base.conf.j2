@@ -3,12 +3,21 @@ variables_hash_bucket_size 128;
 variables_hash_max_size 65536;
 map_hash_bucket_size 128;
 map_hash_max_size 65536;
+server_names_hash_bucket_size 128;
+server_names_hash_max_size 262144;
 {% if geo_enabled %}
-geoip2 {{ s.maxmind_city_db }} {
+geoip2 {{ s.maxmind_country_db }} {
     auto_reload 5m;
     $cdn_country default=ZZ source=$remote_addr country iso_code;
+}
+{% if s.maxmind_city_db.is_file() %}
+geoip2 {{ s.maxmind_city_db }} {
+    auto_reload 5m;
     $cdn_city default=0 source=$remote_addr city geoname_id;
 }
+{% else %}
+map $remote_addr $cdn_city { default 0; }
+{% endif %}
 {% else %}
 map $remote_addr $cdn_country { default ZZ; }
 map $remote_addr $cdn_city { default 0; }

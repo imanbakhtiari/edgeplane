@@ -36,6 +36,7 @@ class User(Record, Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=True)
     preferences: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
+    section_permissions: Mapped[list] = mapped_column(JSONB, default=list, server_default="[]")
 
 
 class LoginSession(Record, Base):
@@ -86,6 +87,14 @@ class AgentHealthHistory(Record, Base):
     __tablename__ = "agent_health_history"
     agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agent_nodes.id"), index=True)
     observed: Mapped[dict] = mapped_column(JSONB)
+
+
+class AgentActivity(Record, Base):
+    __tablename__ = "agent_activities"
+    agent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("agent_nodes.id"), index=True)
+    stage: Mapped[str] = mapped_column(String(50))
+    status: Mapped[str] = mapped_column(String(20))
+    message: Mapped[str] = mapped_column(Text)
 
 
 class AgentConfigState(Record, Base):

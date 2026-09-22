@@ -143,6 +143,7 @@ class RealIPPolicy(Model):
     trusted_cidrs: list[str] = Field(default_factory=list, max_length=128)
     header: str = "X-Forwarded-For"
     recursive: bool = True
+    forward_to_origin: bool = False
     _header = field_validator("header")(header_name)
 
     @field_validator("trusted_cidrs")
@@ -294,7 +295,7 @@ class Vhost(Model):
 class Bundle(Model):
     schema_version: Literal[1, 2] = 2
     revision: int = Field(ge=1)
-    vhosts: list[Vhost] = Field(default_factory=list, max_length=10000)
+    vhosts: list[Vhost] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def unique(self):

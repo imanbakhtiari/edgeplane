@@ -68,6 +68,7 @@ async def test_real_miss_hit_purge_rate_headers_and_real_ip(tmp_path):
     hosts=[v,keyed]
     geo_module=os.getenv("CDN_REAL_GEO_MODULE")
     if geo_module:
+        settings.maxmind_country_db=Path(os.environ["CDN_REAL_MAXMIND"])
         settings.maxmind_city_db=Path(os.environ["CDN_REAL_MAXMIND"])
         from app.schemas.config import GeographicPolicy,PathAccessRule
         geo=keyed.model_copy(deep=True)
