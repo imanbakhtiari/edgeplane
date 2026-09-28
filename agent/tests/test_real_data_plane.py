@@ -10,7 +10,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from app.core.settings import Settings
-from app.schemas.config import Bundle, Vhost, Origin
+from app.schemas.config import Bundle, Vhost, Origin, OriginRoute, RedirectRule, PathAccessRule
 from app.services.deploy import Deployment
 from app.system.adapter import SandboxSystemAdapter
 
@@ -21,6 +21,13 @@ pytestmark = pytest.mark.skipif(
 
 
 async def test_real_miss_hit_purge_rate_headers_and_real_ip(tmp_path):
+    # varnishd deliberately drops privileges while compiling VCL. pytest creates
+    # its per-test directory as 0700, so permit traversal just as production's
+    # managed release roots do.
+    traversal = tmp_path
+    while traversal != Path("/tmp"):
+        traversal.chmod(0o755)
+        traversal = traversal.parent
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             body = b"cached origin asset"
@@ -40,6 +47,16 @@ async def test_real_miss_hit_purge_rate_headers_and_real_ip(tmp_path):
     origin = ThreadingHTTPServer(("127.0.0.1", 18088), Handler)
     thread = threading.Thread(target=origin.serve_forever, daemon=True)
     thread.start()
+    class RoutedHandler(Handler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(b"routed origin")
+
+    routed_origin = ThreadingHTTPServer(("127.0.0.1", 18089), RoutedHandler)
+    routed_thread = threading.Thread(target=routed_origin.serve_forever, daemon=True)
+    routed_thread.start()
     settings = Settings(
         agent_mode="host",
         state_root=tmp_path / "state",
@@ -55,6 +72,7 @@ async def test_real_miss_hit_purge_rate_headers_and_real_ip(tmp_path):
         id=uuid4(), name="E2E", domains=["demo.example.com"], origins=[Origin(host="127.0.0.1", port=18088)]
     )
     v.headers.request = {"X-Custom": "works"}
+    v.real_ip.forward_to_origin = True
     v.rate.rate = 2
     v.rate.burst = 2
     keyed = v.model_copy(deep=True)
@@ -65,12 +83,20 @@ async def test_real_miss_hit_purge_rate_headers_and_real_ip(tmp_path):
     keyed.rate.rate = 1
     keyed.rate.burst = 1
     keyed.real_ip.trusted_cidrs = ["127.0.0.0/8"]
-    hosts=[v,keyed]
+    routed = Vhost(
+        id=uuid4(), name="Routing", domains=["routing.example.com"],
+        origins=[Origin(host="127.0.0.1", port=18088), Origin(host="127.0.0.1", port=18089, backup=True)],
+        origin_routes=[OriginRoute(path="/api/", origin_index=1)],
+        redirect_rules=[RedirectRule(path="/old", target="https://example.net/new")],
+        path_rules=[PathAccessRule(path="/private", action="deny")],
+    )
+    routed.rate.enabled = False
+    hosts=[v,keyed,routed]
     geo_module=os.getenv("CDN_REAL_GEO_MODULE")
     if geo_module:
         settings.maxmind_country_db=Path(os.environ["CDN_REAL_MAXMIND"])
         settings.maxmind_city_db=Path(os.environ["CDN_REAL_MAXMIND"])
-        from app.schemas.config import GeographicPolicy,PathAccessRule
+        from app.schemas.config import GeographicPolicy
         geo=keyed.model_copy(deep=True)
         geo.id=uuid4()
         geo.domains=["geo.example.com"]
@@ -210,6 +236,13 @@ async def test_real_miss_hit_purge_rate_headers_and_real_ip(tmp_path):
                 assert (await client.get("/blocked/test",headers={"Host":"geo.example.com"})).status_code==403
                 assert (await client.get("/internal",headers={"Host":"geo.example.com","X-Forwarded-For":"8.8.8.8"})).status_code==403
                 assert (await client.get("/internal",headers={"Host":"geo.example.com","X-Forwarded-For":"203.0.113.5"})).status_code==200
+            routed_headers = {"Host": "routing.example.com"}
+            assert (await client.get("/api/item", headers=routed_headers)).content == b"routed origin"
+            assert (await client.get("/normal", headers=routed_headers)).content == b"cached origin asset"
+            redirect = await client.get("/old", headers=routed_headers, follow_redirects=False)
+            assert redirect.status_code == 303
+            assert redirect.headers["location"] == "https://example.net/new"
+            assert (await client.get("/private/file", headers=routed_headers)).status_code == 403
 
         assert (settings.log_root / str(v.id) / "access.json.log").exists()
     finally:
@@ -218,5 +251,7 @@ async def test_real_miss_hit_purge_rate_headers_and_real_ip(tmp_path):
             nginx.wait(timeout=10)
         proc.terminate()
         proc.wait(timeout=10)
+        origin.shutdown()
+        routed_origin.shutdown()
         origin.shutdown()
         origin.server_close()

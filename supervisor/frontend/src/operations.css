@@ -1,0 +1,18 @@
+.modal.modal-wide{width:1120px;max-width:calc(100vw - 40px);overflow-x:hidden}
+.service-grid{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+.service-card{min-width:0;text-align:left;white-space:normal}
+.service-card .service-version{white-space:normal;overflow-wrap:anywhere;line-height:1.5}
+.service-card-head{gap:10px}.service-card-head strong{overflow-wrap:anywhere;min-width:0}
+.badge.healthy,.badge.synced,.badge.running{background:#daf5e5!important;color:#22633d!important}
+.badge.out-of-sync,.badge.drifted,.badge.missing,.badge.down,.badge.degraded,.badge.failed{background:#ffe2e2!important;color:#9a3030!important}
+.activity-list{max-height:350px;overflow:auto}.activity-row strong{font-weight:450;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6}
+.terminal-dock{position:fixed;bottom:0;left:240px;right:8px;z-index:110;display:flex;gap:6px;padding:8px;overflow-x:auto;background:#20262dee;border:1px solid #46515c;border-radius:8px 8px 0 0}
+.terminal-overlay{padding-bottom:58px;align-items:center;justify-content:center}.terminal-window.terminal-fullscreen{width:calc(100vw - 24px);height:calc(100dvh - 80px);max-width:none;max-height:none;resize:none}
+.nav-group summary{display:flex;align-items:center;gap:12px;padding:10px 13px;cursor:pointer;font-size:12px;list-style:none;border-radius:6px}
+.nav-group summary:after{content:'›';margin-left:auto}.nav-group[open] summary:after{transform:rotate(90deg)}
+.nav-group>a{margin-left:18px!important;border-left:1px solid #59616b;border-radius:0 6px 6px 0}
+nav a:nth-child(n){margin-top:0}.node-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin:18px 0}
+.node-metric{padding:14px;border:1px solid #71809655;border-radius:8px;min-width:0}.node-metric strong,.node-metric small{display:block;margin-top:6px}.node-metric progress{width:100%;accent-color:#66be8b;height:7px}
+.monitor-node{width:100%;text-align:left;white-space:normal}.monitoring-detail{margin-top:20px}
+.operator-help details{margin:14px 0;border-bottom:1px solid #71809644;padding-bottom:14px}.operator-help summary{cursor:pointer;font-weight:600}.operator-help p{margin-top:12px}
+@media(max-width:720px){.terminal-dock{left:0}.modal.modal-wide{max-width:100%}.service-grid{grid-template-columns:1fr}.terminal-window>header{flex-wrap:wrap}}

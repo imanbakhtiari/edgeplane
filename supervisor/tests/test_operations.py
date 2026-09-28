@@ -16,6 +16,8 @@ def test_origin_aliases_and_rejection(monkeypatch):
     assert not origin_allowed("http://localhost:invalid")
     assert not origin_allowed("http://[invalid")
     monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "supervisor_public_url", "https://console.example.com")
+    monkeypatch.setattr(settings, "allowed_origins", [])
     assert not origin_allowed("http://127.0.0.1:8000")
     monkeypatch.setattr(settings, "allowed_origins", ["https://console.example.com"])
     assert origin_allowed("https://console.example.com")

@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     allow_private_origins: bool = False
     public_port: int = 80
     tls_port: int = 443
+    tls_termination_port: int = 8444
+    tls_passthrough_port: int = 8445
     origin_port: int = 8080
     varnish_port: int = 6081
     retention: int = 5

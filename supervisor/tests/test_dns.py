@@ -16,7 +16,7 @@ async def test_dns_only_eligible_nodes_and_replace_not_duplicate():
     nodes = [SimpleNamespace(public_ipv4="192.0.2.10", public_ipv6=None)]
     hosts = [SimpleNamespace(cdn_hostname="a.edge.example.net", enabled=True, deleted_at=None)]
     db = AsyncMock()
-    db.scalars.side_effect = [Rows(nodes), Rows(hosts)]
+    db.scalars.side_effect = [Rows(nodes), Rows(hosts), Rows([])]
     db.scalar.return_value = None
     added = []
     db.add = lambda row: added.append(row)
@@ -25,6 +25,9 @@ async def test_dns_only_eligible_nodes_and_replace_not_duplicate():
     client.patch.return_value = response
     with (
         patch.object(settings, "powerdns_api_url", "https://dns.example.net"),
+        patch.object(settings, "powerdns_cdn_zone", "edge.example.net"),
+        patch.object(settings, "dns_anycast_ipv4", []),
+        patch.object(settings, "dns_anycast_ipv6", []),
         patch("app.services.dns.httpx.AsyncClient") as factory,
     ):
         factory.return_value.__aenter__.return_value = client

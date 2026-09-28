@@ -1,11 +1,13 @@
 import ipaddress
+import asyncio
+import asyncssh
 from pathlib import Path
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 from typing import Literal
 from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from sqlalchemy import select, delete
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
@@ -13,9 +15,9 @@ from app.api.auth import current_user, role, section_access, SECTIONS
 from app.db.session import session
 from app.models import entities as m
 from app.schemas import config as c
-from app.services.config import POLICIES, configuration_lock, revision, latest, enqueue, restore_revision
+from app.services.config import POLICIES, configuration_lock, revision, latest, enqueue, restore_revision, queue_revision, revision_pending
 from app.services.agents import request_agent
-from app.core.security import encrypt, redact, passwords
+from app.core.security import decrypt, encrypt, redact, passwords
 from app.core.settings import settings
 
 router = APIRouter(dependencies=[Depends(section_access)])
@@ -141,6 +143,7 @@ async def nodes(
     ).all()
     result = []
     desired = await latest(db)
+    building_revision = await revision_pending(db)
     ids = [row.id for row in rows]
     states = {
         s.agent_id: s
@@ -148,16 +151,34 @@ async def nodes(
             await db.scalars(select(m.AgentConfigState).where(m.AgentConfigState.agent_id.in_(ids)))
         ).all()
     }
+    desired_bundle = c.Bundle.model_validate_json(decrypt(desired.encrypted_bundle)) if desired else None
+    desired_hashes = {str(v.id): v.digest() for v in desired_bundle.vhosts if v.enabled} if desired_bundle else {}
+    histories = list((await db.scalars(select(m.AgentHealthHistory).where(m.AgentHealthHistory.agent_id.in_(ids)).distinct(m.AgentHealthHistory.agent_id).order_by(m.AgentHealthHistory.agent_id, m.AgentHealthHistory.created_at.desc()))).all()) if ids else []
+    observed_by_node = {}
+    for history in histories:
+        observed_by_node.setdefault(history.agent_id, history.observed)
     labels_by_node = {}
     for label in (await db.scalars(select(m.AgentLabel).where(m.AgentLabel.agent_id.in_(ids)))).all():
         labels_by_node.setdefault(label.agent_id, {})[label.key] = label.value
     for row in rows:
         state = states.get(row.id)
+        observed = observed_by_node.get(row.id, {})
+        applied_hashes = (observed.get("vhost_hashes") or {})
+        synced = sum(applied_hashes.get(vhost_id) == digest for vhost_id, digest in desired_hashes.items())
+        desired_services = {"nginx", "varnish", "cdn-agent", "prometheus", "prometheus-node-exporter", "prometheus-nginx-exporter", "prometheus-varnish-exporter"}
+        current_services = observed.get("services") or {}
+        healthy_services = sum(bool(current_services.get(name, {}).get("active")) for name in desired_services)
         result.append(
             {
                 **output(row),
                 "applied_revision": state.revision if state else 0,
                 "desired_revision": desired.id if desired else 0,
+                "vhosts_synced": synced,
+                "vhosts_desired": len(desired_hashes),
+                "vhost_state": "QUEUED" if building_revision else "SYNCED" if len(applied_hashes) == len(desired_hashes) and synced == len(desired_hashes) else "OUT OF SYNC",
+                "services_healthy": healthy_services,
+                "services_desired": len(desired_services),
+                "service_state": "HEALTHY" if healthy_services == len(desired_services) else "DEGRADED",
                 "labels": labels_by_node.get(row.id, {}),
             }
         )
@@ -195,6 +216,39 @@ async def node(id: UUID, db=Depends(session)):
         .limit(1)
     )
     return {**output(row), "observed": health.observed if health else {}}
+
+
+@router.get("/agents/{id}/vhosts")
+async def node_vhosts(id: UUID, user=Depends(current_user), db=Depends(session)):
+    """Inspect the exact vhost files in a node's currently applied release."""
+    row = await get(db, m.AgentNode, id)
+    try:
+        applied = await request_agent(db, row, "GET", "/api/v1/config/vhosts")
+    except Exception as exc:
+        raise HTTPException(502, "The node Agent could not return its applied vhost configuration.") from exc
+    desired_revision = await latest(db)
+    building_revision = await revision_pending(db)
+    bundle = c.Bundle.model_validate_json(decrypt(desired_revision.encrypted_bundle)) if desired_revision else None
+    desired = {str(v.id): v for v in bundle.vhosts if v.enabled} if bundle else {}
+    current = {str(v.get("id")): v for v in applied}
+    result = []
+    for vhost_id in sorted(set(desired) | set(current)):
+        wanted, actual = desired.get(vhost_id), current.get(vhost_id)
+        desired_hash = wanted.digest() if wanted else None
+        applied_hash = actual.get("applied_hash") if actual else None
+        status = "SYNCED" if wanted and actual and desired_hash == applied_hash else "MISSING" if wanted and not actual else "EXTRA" if actual and not wanted else "DRIFTED"
+        if building_revision:
+            status = "QUEUED"
+        result.append({
+            **(actual or {}),
+            "id": vhost_id,
+            "name": wanted.name if wanted else actual.get("name", vhost_id),
+            "domains": wanted.domains if wanted else actual.get("domains", []),
+            "desired_hash": desired_hash,
+            "applied_hash": applied_hash,
+            "status": status,
+        })
+    return result
 
 
 @router.put("/agents/{id}/credentials")
@@ -345,6 +399,42 @@ async def maintenance(id: UUID, body: Toggle, request: Request, user=Depends(wri
     return output(node)
 
 
+@router.get("/agents/{id}/services/{service}/logs")
+async def node_service_logs(id: UUID, service: str, request: Request, user=Depends(current_user), db=Depends(session)):
+    from app.services.provisioning import service_command, MANAGED_SERVICES
+
+    if service not in MANAGED_SERVICES:
+        raise HTTPException(404, "Unknown managed service")
+    node = await get(db, m.AgentNode, id)
+    try:
+        result = await service_command(db, node, service, "logs")
+    except ValueError:
+        raise HTTPException(409, "Approved SSH credentials are required to read node service logs.") from None
+    except (asyncssh.Error, OSError, asyncio.TimeoutError):
+        raise HTTPException(502, "Cannot reach node over approved SSH. Test SSH and sudo first.") from None
+    audit(db, user, "READ_NODE_SERVICE_LOGS", f"{id}/{service}", request)
+    return result
+
+
+@router.post("/agents/{id}/services/{service}/restart")
+async def restart_node_service(id: UUID, service: str, request: Request, user=Depends(admin), db=Depends(session)):
+    from app.services.provisioning import service_command, MANAGED_SERVICES
+
+    if service not in MANAGED_SERVICES:
+        raise HTTPException(404, "Unknown managed service")
+    node = await get(db, m.AgentNode, id)
+    try:
+        result = await service_command(db, node, service, "restart")
+    except ValueError:
+        raise HTTPException(409, "Approved SSH credentials are required to control node services.") from None
+    except (asyncssh.Error, OSError, asyncio.TimeoutError):
+        raise HTTPException(502, "Cannot reach node over approved SSH. Test SSH and sudo first.") from None
+    operation = "Validated NGINX and sent graceful reload" if service == "nginx" else f"Restarted {service}"
+    node_activity(db, node, "service", "SUCCESS" if result["success"] else "ERROR", operation if result["success"] else f"{service} restart failed; inspect service logs", user)
+    audit(db, user, "RELOAD_NGINX" if service == "nginx" else "RESTART_NODE_SERVICE", f"{id}/{service}", request)
+    return result
+
+
 @router.post("/agents/{id}/{action}")
 async def node_action(id: UUID, action: str, request: Request, user=Depends(writer), db=Depends(session)):
     node = await get(db, m.AgentNode, id)
@@ -368,11 +458,15 @@ async def node_action(id: UUID, action: str, request: Request, user=Depends(writ
         audit(db, user, action.upper() + "_NODE", id, request)
         return output(node)
     mapping = {
-        "sync": "SYNC",
+        "sync": "VHOST_SYNC",
+        "sync-vhosts": "VHOST_SYNC",
+        "sync-services": "SERVICE_SYNC",
+        "reprovision-services": "SERVICE_SYNC",
         "provision": "PROVISION",
-        "reprovision": "PROVISION",
-        "reprovision-auto-approve": "PROVISION",
-        "upgrade": "PROVISION",
+        "reprovision": "AGENT_UPGRADE",
+        "reprovision-auto-approve": "AGENT_UPGRADE",
+        "upgrade": "AGENT_UPGRADE",
+        "rollback-agent": "AGENT_ROLLBACK",
         "validate": "VALIDATE",
         "reload": "RELOAD",
         "test-origin": "TEST_ORIGIN",
@@ -381,7 +475,7 @@ async def node_action(id: UUID, action: str, request: Request, user=Depends(writ
         raise HTTPException(404, "Unknown action")
     if action == "reload" and node.status not in {"READY", "DEGRADED"}:
         raise HTTPException(409, "Provision and connect the agent before reloading NGINX")
-    if action in {"provision", "reprovision", "reprovision-auto-approve", "upgrade"} and user.role != "ADMIN":
+    if action in {"provision", "reprovision", "reprovision-auto-approve", "upgrade", "rollback-agent", "sync-services", "reprovision-services"} and user.role != "ADMIN":
         raise HTTPException(403, "Administrator required for SSH provisioning")
     if action == "reprovision-auto-approve":
         from app.services.provisioning import credential as ssh_credential, discover
@@ -463,8 +557,12 @@ class VhostInput(c.Model):
             "ip_allow",
             "ip_deny",
             "path_rules",
+            "redirect_rules",
+            "origin_routes",
             "geo",
             "analytics",
+            "redirect_https",
+            "tls_mode",
         }
         if set(value) - allowed:
             raise ValueError("Options may only contain typed traffic/security settings")
@@ -474,6 +572,26 @@ class VhostInput(c.Model):
     @classmethod
     def domains_valid(cls, value):
         return c.Vhost.domains_valid(value)
+
+    @model_validator(mode="after")
+    def valid_tls_controls(self):
+        mode = self.options.get("tls_mode", "auto")
+        if mode not in {"auto", "http_only", "passthrough", "terminate"}:
+            raise ValueError("Invalid TLS mode")
+        if mode == "terminate" and not self.certificate_id:
+            raise ValueError("POP_TLS_CERTIFICATE_REQUIRED")
+        if mode in {"passthrough", "http_only"} and self.certificate_id:
+            raise ValueError("Remove the POP certificate or select POP TLS termination")
+        if mode == "passthrough" and any(o.scheme != "https" for o in self.origins):
+            raise ValueError("TLS passthrough requires HTTPS origins")
+        if self.options.get("redirect_https") and not self.certificate_id:
+            raise ValueError("HTTP_TO_HTTPS_REDIRECT_REQUIRES_EDGE_CERTIFICATE")
+        return self
+
+
+class VhostYaml(c.Model):
+    yaml: str = Field(min_length=1, max_length=2_000_000)
+    deploy: bool = True
 
 
 async def write_vhost(db, body, v):
@@ -508,7 +626,7 @@ async def write_vhost(db, body, v):
 
 
 async def vhost_output(db, v):
-    return {
+    result = {
         **output(v),
         "domains": list(
             (await db.scalars(select(m.VhostDomain.domain).where(m.VhostDomain.vhost_id == v.id))).all()
@@ -521,6 +639,19 @@ async def vhost_output(db, v):
             ).all()
         ),
     }
+    effective = {}
+    fields = {"cache": "cache_policy_id", "rate": "rate_policy_id", "real_ip": "real_ip_policy_id", "headers": "header_policy_id"}
+    for _resource, (model, _schema, key) in POLICIES.items():
+        selected_id = getattr(v, fields[key])
+        policy = await db.get(model, selected_id) if selected_id else await db.scalar(select(model).where(model.is_default.is_(True)))
+        effective[key] = {
+            "source": "vhost" if selected_id else "global",
+            "policy_id": str(policy.id) if policy else None,
+            "policy_name": policy.name if policy else None,
+            "config": policy.config if policy else None,
+        }
+    result["effective_policies"] = effective
+    return result
 
 
 @router.get("/vhosts")
@@ -547,6 +678,66 @@ async def vhosts(
     return [{**output(v), "domains": domains.get(v.id, []), "origins": origins.get(v.id, [])} for v in rows]
 
 
+@router.get("/vhosts/{id}/deployment")
+async def vhost_deployment(id: UUID, user=Depends(current_user), db=Depends(session)):
+    """Compare one desired vhost with the last state reported by every active node."""
+    await get(db, m.Vhost, id)
+    building_revision = await revision_pending(db)
+    desired_revision = await latest(db)
+    bundle = c.Bundle.model_validate_json(decrypt(desired_revision.encrypted_bundle)) if desired_revision else None
+    wanted = next((v for v in bundle.vhosts if v.id == id and v.enabled), None) if bundle else None
+    desired_hash = wanted.digest() if wanted else None
+    nodes = list((await db.scalars(select(m.AgentNode).where(m.AgentNode.active.is_(True), m.AgentNode.demo.is_(False)).order_by(m.AgentNode.name))).all())
+    histories = list((await db.scalars(select(m.AgentHealthHistory).where(m.AgentHealthHistory.agent_id.in_([n.id for n in nodes])).distinct(m.AgentHealthHistory.agent_id).order_by(m.AgentHealthHistory.agent_id, m.AgentHealthHistory.created_at.desc()))).all()) if nodes else []
+    latest_by_node = {}
+    for history in histories:
+        latest_by_node.setdefault(history.agent_id, history)
+    result = []
+    for node in nodes:
+        observed = latest_by_node.get(node.id).observed if latest_by_node.get(node.id) else {}
+        applied_hash = (observed.get("vhost_hashes") or {}).get(str(id))
+        applied_ids = set(observed.get("vhosts") or [])
+        status = "SYNCED" if desired_hash and applied_hash == desired_hash else "MISSING" if desired_hash and str(id) not in applied_ids else "EXTRA" if not desired_hash and str(id) in applied_ids else "DRIFTED" if applied_hash else "UNKNOWN"
+        if building_revision:
+            status = "QUEUED"
+        result.append({"node_id": node.id, "node_name": node.name, "city": node.city, "status": status, "desired_hash": desired_hash, "applied_hash": applied_hash, "last_seen": node.last_seen})
+    return result
+
+
+@router.get("/vhosts/{id}/yaml")
+async def vhost_yaml(id: UUID, user=Depends(current_user), db=Depends(session)):
+    """Export the editable, typed vhost source without certificate secrets."""
+    import yaml
+
+    row = await get(db, m.Vhost, id)
+    data = await vhost_output(db, row)
+    editable = {key: data.get(key) for key in VhostInput.model_fields if key != "deploy"}
+    editable["deploy"] = True
+    normalized = VhostInput.model_validate(editable).model_dump(mode="json")
+    return {"yaml": yaml.safe_dump(normalized, sort_keys=False, allow_unicode=True)}
+
+
+@router.put("/vhosts/{id}/yaml")
+async def update_vhost_yaml(id: UUID, body: VhostYaml, request: Request, user=Depends(writer), db=Depends(session)):
+    """Validate YAML through the same strict schema, then fan out to all active nodes."""
+    import yaml
+
+    await configuration_lock(db)
+    try:
+        raw = yaml.safe_load(body.yaml)
+        if not isinstance(raw, dict):
+            raise ValueError("Vhost YAML must contain one mapping")
+        raw["deploy"] = True
+        parsed = VhostInput.model_validate(raw)
+    except (yaml.YAMLError, ValueError) as exc:
+        raise HTTPException(422, f"Invalid vhost YAML: {exc}") from exc
+    row = await get(db, m.Vhost, id)
+    await write_vhost(db, parsed, row)
+    deployed = await queue_revision(db, user.id)
+    audit(db, user, "EDIT_VHOST_YAML", id, request)
+    return {**await vhost_output(db, row), "deployment_job_id": deployed.id, "deployment_status": "QUEUED"}
+
+
 @router.post("/vhosts")
 async def add_vhost(body: VhostInput, request: Request, user=Depends(writer), db=Depends(session)):
     await configuration_lock(db)
@@ -560,9 +751,9 @@ async def add_vhost(body: VhostInput, request: Request, user=Depends(writer), db
     db.add(v)
     await db.flush()
     await write_vhost(db, body, v)
-    rev = await revision(db, user.id, body.deploy)
+    rev = await queue_revision(db, user.id)
     audit(db, user, "CREATE_VHOST", id, request)
-    return {**await vhost_output(db, v), "revision": rev.id}
+    return {**await vhost_output(db, v), "deployment_job_id": rev.id, "deployment_status": "QUEUED"}
 
 
 @router.put("/vhosts/{id}")
@@ -570,9 +761,9 @@ async def edit_vhost(id: UUID, body: VhostInput, request: Request, user=Depends(
     await configuration_lock(db)
     v = await get(db, m.Vhost, id)
     await write_vhost(db, body, v)
-    rev = await revision(db, user.id, body.deploy)
+    rev = await queue_revision(db, user.id)
     audit(db, user, "EDIT_VHOST", id, request)
-    return {**await vhost_output(db, v), "revision": rev.id}
+    return {**await vhost_output(db, v), "deployment_job_id": rev.id, "deployment_status": "QUEUED"}
 
 
 @router.delete("/vhosts/{id}")
@@ -582,9 +773,9 @@ async def delete_vhost(id: UUID, request: Request, user=Depends(writer), db=Depe
     v.deleted_at = datetime.now(timezone.utc)
     v.enabled = False
     await db.execute(delete(m.VhostDomain).where(m.VhostDomain.vhost_id == id))
-    rev = await revision(db, user.id)
+    rev = await queue_revision(db, user.id)
     audit(db, user, "DELETE_VHOST", id, request)
-    return {"revision": rev.id}
+    return {"deployment_job_id": rev.id, "deployment_status": "QUEUED"}
 
 
 class Purge(c.Model):
@@ -767,7 +958,13 @@ async def rollback(id: int, request: Request, user=Depends(admin), db=Depends(se
 
 @router.post("/sync")
 async def sync(user=Depends(writer), db=Depends(session)):
-    return output(await enqueue(db, "SYNC", user_id=user.id))
+    return output(await enqueue(db, "VHOST_SYNC", user_id=user.id))
+
+
+@router.post("/sync-services")
+async def sync_services(user=Depends(admin), db=Depends(session)):
+    """Reconcile runtime services separately from the vhost desired state."""
+    return output(await enqueue(db, "SERVICE_SYNC", user_id=user.id))
 
 
 @router.get("/audit")
@@ -783,9 +980,39 @@ async def audit_log(offset: int = Query(0, ge=0), db=Depends(session)):
 
 
 class CertificateInput(c.Model):
-    name: str
-    certificate: str
-    private_key: str = Field(repr=False)
+    name: str = Field(min_length=1, max_length=100)
+    source: Literal["manual", "certbot"] = "manual"
+    challenge: Literal["dns-01", "http-01"] = "dns-01"
+    certificate: str = ""
+    private_key: str = Field(default="", repr=False)
+    domains: list[str] = Field(default_factory=list, max_length=100)
+    email: str | None = Field(default=None, max_length=320)
+    auto_renew: bool = True
+    renew_before_days: int = Field(default=30, ge=7, le=60)
+
+    @field_validator("domains")
+    @classmethod
+    def valid_domains(cls, values):
+        return c.Vhost.domains_valid(values) if values else values
+
+    @field_validator("email")
+    @classmethod
+    def valid_email(cls, value):
+        if value and ("@" not in value or value.startswith("@") or value.endswith("@")):
+            raise ValueError("Enter a valid ACME account email")
+        return value
+
+    @model_validator(mode="after")
+    def required_material(self):
+        if self.source == "manual" and (not self.certificate or not self.private_key):
+            raise ValueError("Manual certificates require certificate and private-key PEM")
+        if self.source == "certbot" and (not self.domains or not self.email):
+            raise ValueError("Certbot certificates require at least one domain and an account email")
+        if self.source == "certbot" and self.challenge == "http-01" and any(
+            domain.startswith("*.") for domain in self.domains
+        ):
+            raise ValueError("Wildcard certificates require DNS-01 validation")
+        return self
 
 
 @router.get("/certificates")
@@ -796,32 +1023,67 @@ async def certificates(db=Depends(session)):
 @router.post("/certificates")
 async def certificate(body: CertificateInput, request: Request, user=Depends(admin), db=Depends(session)):
     try:
-        cert = x509.load_pem_x509_certificate(body.certificate.encode())
-        key = serialization.load_pem_private_key(body.private_key.encode(), None)
-        if key.public_key().public_bytes(
-            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
-        ) != cert.public_key().public_bytes(
-            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
-        ):
-            raise ValueError("Key mismatch")
+        certificate_pem, private_key = body.certificate, body.private_key
+        if body.source == "certbot":
+            if not body.email:
+                raise ValueError("Email is required for Certbot")
+            from app.services.certificates import issue
+            from app.services.dns import dns_config
+
+            dns = await dns_config(db) if body.challenge == "dns-01" else None
+            certificate_pem, private_key = await issue(body.domains, body.email, dns, body.challenge)
+        from app.services.certificates import validate_pair
+
+        cert, cert_domains = validate_pair(certificate_pem, private_key)
         if cert.not_valid_after_utc <= datetime.now(timezone.utc):
             raise ValueError("Expired")
-        domains = cert.extensions.get_extension_for_class(
-            x509.SubjectAlternativeName
-        ).value.get_values_for_type(x509.DNSName)
-    except Exception:
-        raise HTTPException(422, "CERTIFICATE_INVALID") from None
+        if body.source == "certbot" and set(body.domains) - set(cert_domains):
+            raise ValueError("Issued certificate does not cover every requested domain")
+    except Exception as exc:
+        detail = str(exc) if str(exc).startswith("CERTBOT_FAILED:") else "CERTIFICATE_INVALID"
+        raise HTTPException(422, detail) from None
     row = m.Certificate(
         name=body.name,
-        certificate=body.certificate,
-        encrypted_key=encrypt(body.private_key),
+        certificate=certificate_pem,
+        encrypted_key=encrypt(private_key),
         expires_at=cert.not_valid_after_utc,
-        domains=domains,
+        domains=cert_domains,
+        source=body.source,
+        challenge=body.challenge,
+        auto_renew=body.source == "certbot" and body.auto_renew,
+        renew_before_days=body.renew_before_days,
+        email=body.email if body.source == "certbot" else None,
+        status="READY",
         created_by=user.id,
     )
     db.add(row)
     await db.flush()
     audit(db, user, "UPLOAD_CERTIFICATE", row.id, request)
+    return output(row)
+
+
+@router.post("/certificates/{id}/renew")
+async def renew_certificate(id: UUID, request: Request, user=Depends(admin), db=Depends(session)):
+    row = await get(db, m.Certificate, id)
+    if row.source != "certbot" or not row.email:
+        raise HTTPException(409, "Only Certbot-managed certificates can be renewed")
+    from app.services.certificates import issue, validate_pair
+    from app.services.dns import dns_config
+
+    try:
+        dns = await dns_config(db) if row.challenge == "dns-01" else None
+        certificate_pem, private_key = await issue(row.domains, row.email, dns, row.challenge)
+        cert, domains = validate_pair(certificate_pem, private_key)
+    except Exception as exc:
+        row.status = "FAILED"
+        raise HTTPException(422, str(exc)) from None
+    row.certificate = certificate_pem
+    row.encrypted_key = encrypt(private_key)
+    row.expires_at = cert.not_valid_after_utc
+    row.domains = domains
+    row.status = "READY"
+    await revision(db, user.id, True)
+    audit(db, user, "RENEW_CERTIFICATE", row.id, request)
     return output(row)
 
 
@@ -860,23 +1122,47 @@ async def add_user(body: UserInput, request: Request, user=Depends(admin), db=De
 
 
 @router.get("/settings")
-async def settings_view(user=Depends(admin)):
-    maxmind = Path(settings.maxmind_country_db)
+async def settings_view(user=Depends(admin), db=Depends(session)):
+    from app.services.runtime_settings import get_group
+    from app.services.dns import dns_config
+    country = Path(settings.maxmind_country_db)
+    city = Path(settings.maxmind_city_db)
+    geoip = await get_group(db, "geoip")
+    monitoring = await get_group(db, "analytics")
+    dns = await dns_config(db)
     return {
         "environment": settings.environment,
-        "cdn_zone": settings.powerdns_cdn_zone,
-        "dns_ttl": settings.dns_ttl,
-        "dns_configured": bool(settings.powerdns_api_url),
+        "cdn_zone": dns.get("zone"),
+        "dns_ttl": dns.get("ttl"),
+        "dns_configured": bool(dns.get("api_url")),
         "health_failures": settings.health_failures,
         "health_successes": settings.health_successes,
         "bgp_enabled": settings.bgp_enabled,
+        "monitoring": monitoring,
         "maxmind": {
-            "available": maxmind.is_file(),
-            "database": "GeoLite2-Country",
-            "bytes": maxmind.stat().st_size if maxmind.is_file() else 0,
-            "provisioned_to_real_agents": maxmind.is_file(),
+            **geoip,
+            "country_available": country.is_file(),
+            "city_available": city.is_file(),
+            "country_bytes": country.stat().st_size if country.is_file() else 0,
+            "city_bytes": city.stat().st_size if city.is_file() else 0,
         },
     }
+
+
+class OperationalSettingsInput(c.Model):
+    country_enabled: bool = True
+    city_enabled: bool = True
+    monitoring_mode: Literal["full", "metrics_only", "off"] = "full"
+
+
+@router.put("/settings")
+async def update_settings(body: OperationalSettingsInput, request: Request, user=Depends(admin), db=Depends(session)):
+    from app.services.runtime_settings import put_group
+    await configuration_lock(db)
+    await put_group(db, "geoip", {"country_enabled": body.country_enabled, "city_enabled": body.city_enabled})
+    await put_group(db, "analytics", {"mode": body.monitoring_mode})
+    audit(db, user, "UPDATE_SYSTEM_SETTINGS", "runtime", request)
+    return {"success": True}
 
 
 @router.get("/dns")
@@ -1117,6 +1403,12 @@ async def edit_node(id: UUID, body: NodeInput, request: Request, user=Depends(ad
     for key, value in body.labels.items():
         db.add(m.AgentLabel(agent_id=id, key=key, value=value))
     audit(db, user, "EDIT_NODE", id, request)
+    # The bulk label delete and server-managed updated_at can expire attributes.
+    # Resolve those values through the async session before synchronous output()
+    # walks the mapped columns; otherwise SQLAlchemy attempts implicit async IO
+    # and raises MissingGreenlet.
+    await db.flush()
+    await db.refresh(node)
     return output(node)
 
 

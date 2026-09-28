@@ -32,6 +32,32 @@ async def dns_config(db):
     }
 
 
+async def import_environment_defaults(db):
+    """Seed PostgreSQL once; subsequent UI changes remain authoritative."""
+    from app.core.security import encrypt
+    import json
+
+    row = await db.scalar(select(m.DNSSetting).limit(1))
+    if row:
+        return False
+    config = {
+        "api_url": settings.powerdns_api_url,
+        "auth_mode": settings.powerdns_auth_mode,
+        "server_id": settings.powerdns_server_id,
+        "zone": settings.powerdns_cdn_zone,
+        "ttl": settings.dns_ttl,
+        "anycast_ipv4": settings.dns_anycast_ipv4,
+        "anycast_ipv6": settings.dns_anycast_ipv6,
+    }
+    secrets = {
+        "api_key": settings.powerdns_api_key,
+        "username": settings.powerdns_username,
+        "password": settings.powerdns_password,
+    }
+    db.add(m.DNSSetting(config=config, encrypted_key=encrypt(json.dumps(secrets))))
+    return True
+
+
 async def reconcile(db):
     config = await dns_config(db)
     if not config["api_url"]:
@@ -106,7 +132,7 @@ async def test_connection(db):
     async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
         try:
             response = await client.get(
-                f"{config['api_url']}/api/v1/servers/{config['server_id']}", **authentication(config)
+                f"{config['api_url'].rstrip('/')}/api/v1/servers/{config['server_id']}", **authentication(config)
             )
             if response.status_code in {401, 403}:
                 return {
@@ -117,14 +143,21 @@ async def test_connection(db):
             response.raise_for_status()
             return {
                 "success": True,
+                "message": f"Connected to PowerDNS server {config['server_id']}. API authentication succeeded.",
                 "auth_mode": config["auth_mode"],
                 "server": response.json().get("id", config["server_id"]),
             }
-        except (httpx.HTTPError, ValueError):
+        except httpx.ConnectTimeout:
             return {
                 "success": False,
-                "message": "PowerDNS API is unreachable or did not return a valid server response",
+                "message": f"Connection timed out reaching {config['api_url']}. Check the URL, routing, firewall, and Docker-to-host address.",
             }
+        except httpx.ConnectError:
+            return {"success": False, "message": f"Cannot connect to {config['api_url']}. Check scheme, host, port, firewall, and whether the PowerDNS webserver/API is listening."}
+        except httpx.HTTPStatusError as exc:
+            return {"success": False, "status": exc.response.status_code, "message": f"PowerDNS returned HTTP {exc.response.status_code}. Check Server ID ({config['server_id']}) and API base URL."}
+        except (httpx.HTTPError, ValueError):
+            return {"success": False, "message": "PowerDNS returned an invalid response. Verify that the URL points to the Authoritative Server API, not PowerDNS-Admin."}
 
 
 def zone_url(config):

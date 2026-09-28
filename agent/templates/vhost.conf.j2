@@ -1,16 +1,23 @@
+# Edgeplane vhost: {{ v.name }}
+# Domains: {{ v.domains|join(', ') }}
+# Vhost ID: {{ v.id }}
 upstream origin_{{ v.id.hex }} {
 {% for origin,ips in addresses[v.id|string] %}{% for ip in ips %}
     server {{ '['+ip+']' if ':' in ip else ip }}:{{ origin.port }} weight={{ origin.weight }} max_fails={{ origin.max_fails }} fail_timeout={{ origin.fail_timeout }}s{{ ' backup' if origin.backup else '' }};
 {% endfor %}{% endfor %}
     keepalive {{ v.origins[0].keepalive }};
 }
-server {
-    listen {{ s.public_port }};
-{% if v.tls %}
-    listen {{ s.tls_port }} ssl;
+{% for index in v.origin_routes|map(attribute='origin_index')|unique|sort %}{% set route_origin = v.origins[index] %}upstream origin_{{ v.id.hex }}_{{ index }} {
+{% for ip in addresses[v.id|string][index][1] %}    server {{ '['+ip+']' if ':' in ip else ip }}:{{ route_origin.port }} max_fails={{ route_origin.max_fails }} fail_timeout={{ route_origin.fail_timeout }}s;
+{% endfor %}    keepalive {{ route_origin.keepalive }};
+}
+{% endfor %}{% for tls_listener in ([false, true] if v.tls else [false]) %}server {
+{% if tls_listener %}
+    listen 127.0.0.1:{{ s.tls_termination_port }} ssl proxy_protocol;
     ssl_certificate {{ release }}/tls/{{ v.id }}.pem;
     ssl_certificate_key {{ release }}/tls/{{ v.id }}.key;
     ssl_protocols TLSv1.2 TLSv1.3;
+{% else %}    listen {{ s.public_port }};
 {% endif %}
     server_name {{ v.domains|join(' ') }};
 {% if v.analytics.mode != 'off' %}
@@ -26,7 +33,11 @@ server {
 
 {% for cidr in v.real_ip.trusted_cidrs %}    set_real_ip_from {{ cidr }};
 {% endfor %}
-    real_ip_header {{ v.real_ip.header }};
+{% if tls_listener %}    # Only the loopback TLS router may supply a PROXY protocol address.
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
+{% else %}    real_ip_header {{ v.real_ip.header }};
+{% endif %}
     real_ip_recursive {{ 'on' if v.real_ip.recursive else 'off' }};
     gzip on;
     gzip_types text/css application/javascript application/json image/svg+xml;
@@ -53,8 +64,20 @@ server {
 {% endif %}
 {% for path in v.blocked_paths %}    location ^~ {{ path }} { return 403; }
 {% endfor %}
+    # ACME HTTP-01 is served locally on every POP, before cache and origin routing.
+    location ^~ /.well-known/acme-challenge/ {
+        default_type text/plain;
+        root {{ s.state_root }}/acme-webroot;
+        try_files $uri =404;
+        access_log off;
+        add_header Cache-Control "no-store" always;
+    }
     location / {
-        if ($request_method = PURGE) { return 405; }
+{% if v.redirect_https and v.tls -%}
+        if ($scheme = http) { return 301 https://$host$request_uri; }
+{% endif -%}
+{% for rule in v.redirect_rules %}        if ($uri {{ '=' if rule.match == 'exact' else '~' }} {{ rule.path if rule.match == 'exact' else '^' + rule.path }}) { return 303 {{ rule.target }}; }
+{% endfor %}        if ($request_method = PURGE) { return 405; }
 {% if v.allowed_methods %}        if ($request_method !~ ^({{ v.allowed_methods|join('|') }})$) { return 405; }
 {% endif %}
         # Allowlist prevents ALL client X-CDN-* headers from entering the data plane.
@@ -94,10 +117,29 @@ server {
 {% endif %}
     }
 }
-server {
+{% endfor %}server {
     listen 127.0.0.1:{{ s.origin_port }};
     server_name {{ v.domains|join(' ') }};
-    location / {
+{% for route in v.origin_routes %}{% set route_origin = v.origins[route.origin_index] %}    location {{ '=' if route.match == 'exact' else '^~' }} {{ route.path }} {
+        proxy_pass {{ route_origin.scheme }}://origin_{{ v.id.hex }}_{{ route.origin_index }};
+        proxy_http_version 1.1;
+        proxy_set_header Connection $cdn_connection;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Host {{ route_origin.host_header or '$host' }};
+        proxy_set_header X-CDN-Vhost '';
+        proxy_set_header X-CDN-Policy '';
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_ssl_server_name on;
+        proxy_ssl_name {{ route_origin.sni or route_origin.host_header or '$host' }};
+        proxy_ssl_verify {{ 'on' if route_origin.tls_verify else 'off' }};
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_connect_timeout {{ route_origin.connect_timeout }}s;
+        proxy_read_timeout {{ route_origin.read_timeout }}s;
+        proxy_send_timeout {{ route_origin.send_timeout }}s;
+        proxy_next_upstream error timeout http_502 http_503 http_504;
+        proxy_hide_header X-CDN-Vhost;
+    }
+{% endfor %}    location / {
         proxy_pass {{ v.origins[0].scheme }}://origin_{{ v.id.hex }};
         proxy_http_version 1.1;
         proxy_set_header Connection $cdn_connection;
@@ -107,7 +149,7 @@ server {
         proxy_set_header X-CDN-Policy '';
         proxy_set_header X-Forwarded-Host $host;
         proxy_ssl_server_name on;
-        proxy_ssl_name {{ v.origins[0].sni or v.origins[0].host }};
+        proxy_ssl_name {{ v.origins[0].sni or v.origins[0].host_header or '$host' }};
         proxy_ssl_verify {{ 'on' if v.origins[0].tls_verify else 'off' }};
         proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
         proxy_connect_timeout {{ v.origins[0].connect_timeout }}s;

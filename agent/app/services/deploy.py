@@ -20,7 +20,14 @@ class Deployment:
             settings.log_root,
         ):
             path.mkdir(parents=True, exist_ok=True)
+        # varnishd drops privileges before compiling/using VCL. Permit traversal
+        # of managed roots without exposing directory listings or TLS material.
+        settings.nginx_config_root.chmod(0o711)
+        settings.varnish_config_root.chmod(0o711)
         (settings.log_root / "metrics").mkdir(parents=True, exist_ok=True)
+        candidate_temp = settings.state_root / "nginx-candidate"
+        for name in ("body", "proxy", "fastcgi", "uwsgi", "scgi"):
+            (candidate_temp / name).mkdir(parents=True, exist_ok=True)
         self.metadata = settings.state_root / "applied.json"
         self.journal = settings.state_root / "activation.json"
 
@@ -28,6 +35,41 @@ class Deployment:
         if self.metadata.exists():
             return json.loads(self.metadata.read_text())
         return {"revision": 0, "hash": None, "vhosts": []}
+
+    def applied_vhosts(self):
+        """Return the public NGINX files in the active, atomically applied release."""
+        current = self.s.nginx_config_root / "current"
+        if not current.exists():
+            return []
+        release = current.resolve()
+        releases = (self.s.nginx_config_root / "releases").resolve()
+        if release.parent != releases:
+            raise RuntimeError("ACTIVE_RELEASE_OUTSIDE_MANAGED_ROOT")
+        result = []
+        metadata = self.current()
+        for path in sorted((release / "http").glob("*.conf")):
+            if path.name == "00-base.conf" or path.is_symlink():
+                continue
+            content = path.read_text()
+            comments = {}
+            for line in content.splitlines()[:5]:
+                if line.startswith("# ") and ": " in line:
+                    key, value = line[2:].split(": ", 1)
+                    comments[key.lower()] = value
+            vhost_id = comments.get("vhost id")
+            if not vhost_id:
+                # Compatibility with releases created before friendly filenames.
+                vhost_id = path.stem.split("--")[-1]
+            result.append({
+                "id": vhost_id,
+                "name": comments.get("edgeplane vhost", path.stem),
+                "domains": [v.strip() for v in comments.get("domains", "").split(",") if v.strip()],
+                "filename": path.name,
+                "content": content,
+                "revision": metadata.get("revision", 0),
+                "applied_hash": metadata.get("vhost_hashes", {}).get(vhost_id),
+            })
+        return result
 
     @contextmanager
     def lock(self):
@@ -71,12 +113,18 @@ class Deployment:
     async def prepare(self, bundle):
         release = self.s.nginx_config_root / "releases" / f"{bundle.revision}-{uuid4().hex}"
         release.mkdir(parents=True, mode=0o755)
+        release.parent.chmod(0o711)
+        release.chmod(0o711)
         try:
             files = await render(bundle, self.s, release)
             for name, content in files.items():
                 file = release / name
                 file.parent.mkdir(parents=True, exist_ok=True)
                 file.write_text(content)
+                if name == "default.vcl":
+                    # Only rendered VCL is readable by varnish's unprivileged
+                    # compiler; TLS keys stay private in release/tls (0700).
+                    file.chmod(0o644)
             for v in bundle.vhosts:
                 (self.s.log_root / str(v.id)).mkdir(parents=True, exist_ok=True)
                 if v.tls:
@@ -139,10 +187,34 @@ class Deployment:
                     raise HTTPException(409, detail={"code": "REVISION_CONFLICT"})
                 if digest == previous["hash"]:
                     previous["revision"] = bundle.revision
+                    # Upgrade legacy state even when the rendered bundle is unchanged.
+                    previous["vhosts"] = [str(v.id) for v in bundle.vhosts if v.enabled]
+                    previous["vhost_hashes"] = {
+                        str(v.id): v.digest() for v in bundle.vhosts if v.enabled
+                    }
+                    previous["telemetry"] = {
+                        str(v.id): {
+                            "customer_id": str(v.customer_id) if v.customer_id else "",
+                            "mode": v.analytics.mode,
+                            "geography": v.analytics.geography,
+                        }
+                        for v in bundle.vhosts
+                        if v.enabled
+                    }
                     self.save(previous)
                     return {"success": True, "noop": True, **previous}
             release, files = await self.prepare(bundle)
             result = await self.validate_candidate(release)
+            # A candidate can validate while the installed master lacks its
+            # stream include. Never claim HTTPS applied in that situation.
+            from app.system.adapter import HostSystemAdapter
+            if result.get("success") and isinstance(self.system, HostSystemAdapter) and "listen " in files.get("stream/00-tls.conf", ""):
+                installed = await self.system.run(self.s.nginx_binary, "-T")
+                expected = f"include {self.s.nginx_config_root}/current/stream/*.conf;"
+                if installed.code or expected not in installed.stdout:
+                    result = {"success": False, "validation_failed": True,
+                              "error": "TLS_ROUTER_NOT_INSTALLED",
+                              "stderr": "Install the NGINX stream module and managed stream include using service provisioning before syncing TLS routes. Previous configuration remains active."}
             if not result["success"] or validate_only:
                 shutil.rmtree(release)
                 return {
@@ -194,6 +266,7 @@ class Deployment:
                 "vcl": vcl,
                 "release": str(release),
                 "vhosts": [str(v.id) for v in bundle.vhosts if v.enabled],
+                "vhost_hashes": {str(v.id): v.digest() for v in bundle.vhosts if v.enabled},
                 "telemetry": {
                     str(v.id): {
                         "customer_id": str(v.customer_id) if v.customer_id else "",

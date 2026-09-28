@@ -98,6 +98,28 @@ async def enqueue(db, kind, payload=None, node_ids=None, user_id=None, idempoten
                 )
             ).all()
         )
+    # For state reconciliation, retain at most one pending successor per node.
+    # A running target may already have captured an older desired snapshot, so
+    # it is intentionally not coalesced with the pending newest-state target.
+    if kind in {"SYNC", "VHOST_SYNC", "SERVICE_SYNC"} and node_ids:
+        already_pending = set(
+            (
+                await db.scalars(
+                    select(m.JobTarget.agent_id)
+                    .join(m.Job, m.Job.id == m.JobTarget.job_id)
+                    .where(
+                        m.Job.kind.in_(
+                            ["SYNC", "VHOST_SYNC"]
+                            if kind in {"SYNC", "VHOST_SYNC"}
+                            else ["SERVICE_SYNC"]
+                        ),
+                        m.JobTarget.status == "PENDING",
+                        m.JobTarget.agent_id.in_(node_ids),
+                    )
+                )
+            ).all()
+        )
+        node_ids = [node_id for node_id in node_ids if node_id not in already_pending]
     for node_id in node_ids:
         db.add(m.JobTarget(job_id=job.id, agent_id=node_id))
     if not node_ids:
@@ -127,8 +149,34 @@ async def revision(db, user_id=None, deploy=True, bundle=None):
         db.add(m.ConfigurationRevisionItem(revision_id=row.id, vhost_id=v.id, config=safe))
     await db.flush()
     if deploy:
-        await enqueue(db, "SYNC", {"revision": row.id}, user_id=user_id)
+        await enqueue(db, "VHOST_SYNC", {"revision": row.id}, user_id=user_id)
     return row
+
+
+async def queue_revision(db, user_id=None):
+    """Durably coalesce saves; expensive fleet snapshots are worker work.
+
+    A RUNNING snapshot is never reused: it may already have read old data.
+    The configuration transaction lock makes the pending successor race-free.
+    """
+    await configuration_lock(db)
+    pending = await db.scalar(select(m.Job).join(m.JobTarget, m.JobTarget.job_id == m.Job.id)
+                             .where(m.Job.kind == "BUILD_REVISION", m.JobTarget.status == "PENDING")
+                             .limit(1))
+    if pending:
+        return pending
+    job = m.Job(kind="BUILD_REVISION", created_by=user_id, payload={})
+    db.add(job)
+    await db.flush()
+    db.add(m.JobTarget(job_id=job.id, agent_id=None))
+    db.add(m.JobEvent(job_id=job.id, message="Vhost changes saved; configuration build queued"))
+    return job
+
+
+async def revision_pending(db):
+    return bool(await db.scalar(select(m.JobTarget.id).join(m.Job, m.Job.id == m.JobTarget.job_id)
+                                .where(m.Job.kind == "BUILD_REVISION",
+                                       m.JobTarget.status.in_(["PENDING", "RUNNING"])).limit(1)))
 
 
 async def restore_revision(db, old, user_id):

@@ -20,6 +20,10 @@ class Base(DeclarativeBase):
 
 
 class Record:
+    # Fetch server-generated update timestamps during the awaited flush. Async
+    # response serialization must never trigger an implicit database query.
+    __mapper_args__ = {"eager_defaults": True}
+
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -133,6 +137,12 @@ class Certificate(Record, Base):
     encrypted_key: Mapped[str] = mapped_column(Text)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     domains: Mapped[list] = mapped_column(JSONB)
+    source: Mapped[str] = mapped_column(String(20), default="manual")
+    challenge: Mapped[str] = mapped_column(String(20), default="dns-01")
+    auto_renew: Mapped[bool] = mapped_column(Boolean, default=False)
+    renew_before_days: Mapped[int] = mapped_column(Integer, default=30)
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="READY")
 
 
 class Vhost(Record, Base):

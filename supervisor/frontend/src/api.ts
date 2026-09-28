@@ -1,6 +1,7 @@
 export type Row = Record<string, any>;
 let csrf = '';
 export function setCSRF(value: string) { csrf = value; }
+export function getCSRF() { return csrf; }
 export async function api<T = any>(path: string, method = 'GET', body?: unknown): Promise<T> {
   const response = await fetch('/api/v1' + path, { method, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf }, body: body === undefined ? undefined : JSON.stringify(body) });
   const text = await response.text();

@@ -30,6 +30,7 @@ sub vcl_hash {
     hash_data(req.http.host);
     hash_data(req.http.X-CDN-Vhost);
     hash_data(req.http.X-CDN-Policy);
+    hash_data(req.http.X-Forwarded-Proto);
     return (lookup);
 }
 sub vcl_backend_response {

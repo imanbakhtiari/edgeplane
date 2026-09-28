@@ -5,6 +5,10 @@ from contextlib import suppress
 import os
 import ssl
 import time
+import subprocess
+import shutil
+import re
+from functools import lru_cache
 import ipaddress
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -20,6 +24,7 @@ import logging
 from app.schemas.config import Bundle, Model, Origin
 from app.services.deploy import Deployment
 from app.services.origins import test_origin
+from app.services.node_metrics import network_sample, cache_storage
 from app.system.adapter import HostSystemAdapter, SandboxSystemAdapter
 
 configure()
@@ -61,6 +66,20 @@ async def lifespan(application):
 
 
 app = FastAPI(title="CDN Agent", version="0.1.0", lifespan=lifespan)
+
+ACME_TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+ACME_VALIDATION = re.compile(r"^[A-Za-z0-9_.-]{1,1024}$")
+
+
+class AcmeChallenge(Model):
+    token: str = Field(min_length=1, max_length=256)
+    validation: str = Field(default="", max_length=1024)
+
+
+def acme_challenge_path(token: str) -> Path:
+    if not ACME_TOKEN.fullmatch(token):
+        raise HTTPException(422, "Invalid ACME challenge token")
+    return s.state_root / "acme-webroot" / ".well-known" / "acme-challenge" / token
 
 
 @app.middleware("http")
@@ -169,12 +188,55 @@ async def routing_status():
     }
 
 
+@lru_cache(maxsize=1)
+def component_versions():
+    commands = {
+        "nginx": ("nginx", "-v"),
+        "varnish": ("varnishd", "-V"),
+        "prometheus": ("prometheus", "--version"),
+        "bird": ("bird", "--version"),
+        "node_exporter": ("prometheus-node-exporter", "--version"),
+        "nginx_exporter": ("prometheus-nginx-exporter", "--version"),
+        "varnish_exporter": ("prometheus-varnish-exporter", "--version"),
+    }
+    versions = {}
+    for name, command in commands.items():
+        if not shutil.which(command[0]):
+            continue
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=3, check=False)
+            line = (result.stdout or result.stderr).splitlines()
+            if result.returncode == 0 and line:
+                versions[name] = line[0][:160]
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return versions
+
+
 @app.get("/api/v1/status")
 async def status():
+    cache = []
+    cache_error = None
+    try:
+        result = await system.run(s.varnishstat_binary, "-j", "-1")
+        if result.code == 0:
+            cache = cache_storage(result.stdout)
+        else:
+            cache_error = "Varnish storage counters unavailable"
+    except (ValueError, KeyError, OSError):
+        cache_error = "Varnish storage counters unavailable"
+    cores = psutil.cpu_count() or 1
+    marker = Path(__file__).resolve().parents[1] / '.bootstrap-source-sha256'
+    build = marker.read_text().strip()[:12] if marker.is_file() else 'development'
+    release_file = s.state_root / 'agent-releases.json'
+    previous = None
+    if release_file.is_file():
+        previous = (json.loads(release_file.read_text()).get('previous') or {}).get('version')
     return {
         "agent_id": s.agent_id,
         "hostname": s.agent_name,
-        "agent_version": "0.1.0",
+        "agent_version": "0.1.0+" + build,
+        "previous_agent_version": previous[:12] if previous else None,
         "schema_versions": [1, 2],
         "mode": s.agent_mode,
         **deploy.current(),
@@ -183,7 +245,14 @@ async def status():
         "ram": psutil.virtual_memory().percent,
         "disk": psutil.disk_usage(s.state_root).percent,
         "load": os.getloadavg(),
+        "cpu_count": cores,
+        "load_percent": os.getloadavg()[0] / cores * 100,
+        "network": network_sample(),
+        "cache_storage": cache,
+        "cache_error": cache_error,
+        "sampled_at": time.time(),
         "services": await services(),
+        "component_versions": await asyncio.to_thread(component_versions),
         "routing": await routing_status(),
     }
 
@@ -191,6 +260,11 @@ async def status():
 @app.get("/api/v1/config/current")
 async def current():
     return deploy.current()
+
+
+@app.get("/api/v1/config/vhosts")
+async def applied_vhosts():
+    return deploy.applied_vhosts()
 
 
 @app.post("/api/v1/config/apply")
@@ -214,6 +288,33 @@ async def validate_nginx():
 async def reload_nginx():
     with deploy.lock():
         return await deploy.guarded_reload()
+
+
+@app.post("/api/v1/acme/challenge")
+async def install_acme_challenge(body: AcmeChallenge):
+    if not ACME_VALIDATION.fullmatch(body.validation):
+        raise HTTPException(422, "Invalid ACME challenge validation")
+    path = acme_challenge_path(body.token)
+    public_root = s.state_root / "acme-webroot"
+    challenge_root = public_root / ".well-known" / "acme-challenge"
+    for directory in (public_root, public_root / ".well-known", challenge_root):
+        directory.mkdir(parents=True, exist_ok=True)
+        # The Agent runs with UMask=0027. This path intentionally contains
+        # public ACME tokens and must be traversable by the NGINX worker.
+        directory.chmod(0o755)
+    temporary = path.with_name(path.name + ".tmp-" + uuid4().hex)
+    temporary.write_text(body.validation, encoding="ascii")
+    temporary.chmod(0o644)
+    temporary.replace(path)
+    return {"success": True, "token": body.token}
+
+
+@app.post("/api/v1/acme/challenge/cleanup")
+async def cleanup_acme_challenge(body: AcmeChallenge):
+    path = acme_challenge_path(body.token)
+    with suppress(FileNotFoundError):
+        path.unlink()
+    return {"success": True, "token": body.token}
 
 
 class Purge(Model):

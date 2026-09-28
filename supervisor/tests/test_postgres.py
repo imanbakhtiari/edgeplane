@@ -4,7 +4,7 @@ import os
 from uuid import uuid4
 import pytest
 from httpx import AsyncClient, ASGITransport
-from sqlalchemy import text
+from sqlalchemy import text, select
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("CDN_TEST_DATABASE"),
@@ -58,7 +58,20 @@ async def test_api_rbac_revisions_jobs_and_immutability():
                 },
             )
             assert node.status_code == 200, node.text
-            node.json()["id"]
+            node_id = node.json()["id"]
+            edited_node = await client.put(
+                "/api/v1/agents/" + node_id,
+                json={
+                    "name": "edge-edited-" + suffix,
+                    "hostname": "127.0.0.1",
+                    "management_url": "http://127.0.0.1:19443",
+                    "city": "Shiraz",
+                    "country": "Iran",
+                    "labels": {"region": "south"},
+                },
+            )
+            assert edited_node.status_code == 200, edited_node.text
+            assert edited_node.json()["city"] == "Shiraz"
             host = await client.post(
                 "/api/v1/vhosts",
                 json={
@@ -68,8 +81,8 @@ async def test_api_rbac_revisions_jobs_and_immutability():
                 },
             )
             assert host.status_code == 200, host.text
-            rev = host.json()["revision"]
-            assert rev > 0
+            rev = host.json()["deployment_job_id"]
+            assert host.json()["deployment_status"] == "QUEUED"
             policies = await client.get("/api/v1/cache-policies")
             assert len(policies.json()) >= 6
             updated = await client.put(
@@ -82,9 +95,17 @@ async def test_api_rbac_revisions_jobs_and_immutability():
                 },
             )
             assert updated.status_code == 200, updated.text
-            assert updated.json()["revision"] > rev
+            assert updated.json()["deployment_job_id"] == rev
+            assert updated.json()["deployment_status"] == "QUEUED"
+            # Two saves coalesce before a worker builds one newest-state revision.
+            from app.workers.runner import perform
+            async with Session() as db:
+                build_target = await db.scalar(select(m.JobTarget.id).join(m.Job)
+                                               .where(m.Job.kind == "BUILD_REVISION", m.JobTarget.status == "PENDING"))
+            assert build_target
+            await perform(build_target)
             jobs = (await client.get("/api/v1/jobs")).json()
-            assert any(j["kind"] == "SYNC" for j in jobs)
+            assert any(j["kind"] == "VHOST_SYNC" for j in jobs)
             login = await client.post(
                 "/api/v1/auth/login", json={"username": "viewer-" + suffix, "password": "test-password-123"}
             )

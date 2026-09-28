@@ -25,12 +25,15 @@ class Settings(BaseSettings):
     powerdns_username: str = ""
     powerdns_password: str = ""
     job_poll_interval: float = 2
+    vhost_reconcile_debounce_seconds: float = 2
     agent_connect_timeout: int = 10
     agent_request_timeout: int = 120
     powerdns_api_url: str = ""
     powerdns_api_key: str = ""
     powerdns_server_id: str = "localhost"
     powerdns_cdn_zone: str = "edge.example.net"
+    acme_directory_url: str = "https://acme-v02.api.letsencrypt.org/directory"
+    acme_dns_propagation_seconds: int = 30
     dns_ttl: int = 60
     dns_anycast_ipv4: list[str] = []
     dns_anycast_ipv6: list[str] = []

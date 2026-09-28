@@ -1,6 +1,7 @@
 import secrets
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.security import HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import select, delete
 from app.db.session import session
@@ -25,6 +26,7 @@ def effective_sections(user):
     return sorted((configured if configured else ROLE_SECTIONS.get(user.role, set())) & SECTIONS)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+bearer_scheme = HTTPBearer(auto_error=False, description="Revocable Edgeplane API token")
 
 
 def origin_allowed(origin: str) -> bool:
@@ -80,8 +82,10 @@ class PasswordChange(BaseModel):
     new_password: str = Field(min_length=12, max_length=128)
 
 
-async def current_user(request: Request, db=Depends(session)):
+async def current_user(request: Request, db=Depends(session), _bearer=Depends(bearer_scheme)):
     authorization = request.headers.get("Authorization", "")
+    if not authorization.startswith("Bearer ") and not request.cookies.get("cdn_session"):
+        raise HTTPException(401, "Authentication required")
     if authorization.startswith("Bearer "):
         token = await db.scalar(
             select(APIToken).where(
@@ -130,7 +134,7 @@ async def current_user(request: Request, db=Depends(session)):
 async def section_access(request: Request, user=Depends(current_user)):
     relative = request.url.path.removeprefix("/api/v1/")
     part = relative.split("/", 1)[0]
-    aliases = {"agents": "nodes", "sync": "nodes", "config-revisions": "settings", "geo": "traffic"}
+    aliases = {"agents": "nodes", "sync": "nodes", "sync-services": "nodes", "config-revisions": "settings", "geo": "traffic"}
     section = aliases.get(part, part if part in SECTIONS else None)
     if relative == "settings/dns" or relative.startswith("dns/"):
         section = "dns"
@@ -229,6 +233,10 @@ async def change(body: PasswordChange, user=Depends(current_user), db=Depends(se
 
 @router.post("/logout")
 async def logout(request: Request, response: Response, user=Depends(current_user), db=Depends(session)):
+    api_token = getattr(request.state, "api_token", None)
+    if api_token:
+        api_token.revoked = True
+        return {"success": True}
     await db.execute(
         delete(LoginSession).where(LoginSession.token_hash == token_hash(request.cookies["cdn_session"]))
     )

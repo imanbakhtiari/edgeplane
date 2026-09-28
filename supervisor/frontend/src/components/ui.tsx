@@ -28,9 +28,19 @@ const FIELD_HELP:Record<string,string>={
  "hostname / ip":"Origin server DNS name or IP address that receives cache misses from the CDN.",
  "port":"TCP port exposed by the origin, commonly 80 for HTTP or 443 for HTTPS.",
  "host header":"HTTP Host header sent to the origin. Leave blank to use the customer request host.",
- "sni":"TLS server name used when connecting to an HTTPS origin. Usually the origin certificate hostname.",
+ "sni":"Required when an HTTPS origin is entered as an IP address. Enter the DNS hostname printed on the origin certificate (for example origin.example.com); this controls certificate verification and TLS SNI.",
  "maximum request body (mb)":"Largest accepted client request body for this vhost; requests above it are rejected.",
  "path":"URL path used by this access rule, beginning with /.",
+ "redirect path":"URL path to redirect. Use / with prefix matching to redirect the entire vhost.",
+ "origin route path":"URL path that should use one chosen origin. Prefix matching includes every path beginning with these characters.",
+ "redirect target url":"Fixed http:// or https:// destination. The redirect does not forward the original path or query string.",
+ "trusted cidrs":"Only these proxy networks may supply the configured client-IP header. Never trust the entire Internet.",
+ "header":"For Real IP, the trusted client-IP header, normally X-Forwarded-For. Header values from untrusted senders are ignored.",
+ "recursive":"Walk a trusted proxy chain to select the last non-trusted client IP.",
+ "forward to origin":"Send the resolved client IP as X-Real-IP and X-Forwarded-For to the origin. Leave off if the origin must not receive it.",
+ "request":"JSON object of fixed HTTP headers sent to the origin, for example {\"X-CDN-Source\":\"edge\"}. These override matching forwarded headers.",
+ "response":"JSON object of HTTP headers sent to clients, for example {\"X-Content-Type-Options\":\"nosniff\"}.",
+ "debug":"Send X-Served-By and X-Request-ID response headers for diagnostics. Turn off if POP identity must not be disclosed.",
  "country codes · comma separated, e.g. ir, de":"Two-letter ISO country codes evaluated using the installed MaxMind database.",
  "geonames city ids · comma separated":"Numeric GeoNames IDs from the MaxMind City database; use the IP lookup tool to find them.",
  "allowed ips / cidrs · one per line":"Client addresses or networks allowed by this path rule, such as 192.0.2.10 or 192.0.2.0/24.",
@@ -49,10 +59,10 @@ export function Help({text}:{text:string}){
  return <><span className="help-tip" tabIndex={0} role="img" aria-label={text} onMouseEnter={e=>show(e.currentTarget)} onMouseLeave={()=>setPosition(null)} onFocus={e=>show(e.currentTarget)} onBlur={()=>setPosition(null)}>!</span>{position&&createPortal(<span className={'help-popover '+(position.above?'above':'')} role="tooltip" style={{left:position.left,top:position.top}}>{text}</span>,document.body)}</>;
 }
 export function LabelText({children,help}:{children:React.ReactNode,help?:string}){return <span className="label-text">{children}{help&&<Help text={help}/>}</span>}
-export function Badge({value}:{value:unknown}) { const text=String(value ?? 'PENDING'); return <span className={'badge '+text.toLowerCase()}><i/>{text}</span>; }
+export function Badge({value}:{value:unknown}) { const text=String(value ?? 'PENDING'); return <span className={'badge '+text.toLowerCase().replaceAll(' ','-')}><i/>{text}</span>; }
 export function Empty({title='No records yet',text='Create your first resource to begin managing your CDN.'}) {return <div className="empty"><Layers size={32}/><h3>{title}</h3><p>{text}</p></div>}
 export function ErrorBox({error}:{error:unknown}) {return error ? <div className="error" role="alert"><AlertCircle size={17}/>{String(error instanceof Error ? error.message:error)}</div>:null}
-export function Modal({title,children,close}:{title:string,children:React.ReactNode,close:()=>void}) {return <div className="overlay" onClick={close}><section className="modal" role="dialog" aria-modal="true" aria-label={title} onClick={e=>e.stopPropagation()}><header><h2>{title}</h2><button aria-label="Close" onClick={close}><X size={20}/></button></header>{children}</section></div>}
+export function Modal({title,children,close,wide=false}:{title:string,children:React.ReactNode,close:()=>void,wide?:boolean}) {return <div className="overlay" onClick={close}><section className={'modal '+(wide?'modal-wide':'')} role="dialog" aria-modal="true" aria-label={title} onClick={e=>e.stopPropagation()}><header><h2>{title}</h2><button aria-label="Close" onClick={close}><X size={20}/></button></header>{children}</section></div>}
 export function ConfirmDialog({title,message,confirmLabel='Confirm',danger=false,busy=false,onConfirm,onCancel}:{title:string,message:string,confirmLabel?:string,danger?:boolean,busy?:boolean,onConfirm:()=>void,onCancel:()=>void}) {
  return <Modal title={title} close={onCancel}><div className="confirm-body"><AlertCircle size={25}/><div><h3>{message}</h3><p>Review this operation before continuing. Progress and failures will be recorded in the activity log.</p></div></div><footer><button disabled={busy} onClick={onCancel}>Cancel</button><button disabled={busy} className={danger?'danger':'primary'} onClick={onConfirm}>{busy?'Working…':confirmLabel}</button></footer></Modal>;
 }
@@ -60,7 +70,7 @@ export function Field({label,value,onChange,type='text',required=false,help}:{la
 export function Table({rows,columns,onClick}:{rows:Row[],columns:string[],onClick?:(row:Row)=>void}) {
  if(!rows.length)return <Empty/>;
  const visible=columns.includes('is_default')&&rows.some(row=>'enabled' in row)?['name','enabled','is_default','config']:columns;
- return <div className="tablewrap"><table><thead><tr>{visible.map(c=><th key={c}>{c.replaceAll('_',' ')}</th>)}{onClick&&<th/>}</tr></thead><tbody>{rows.map((row,i)=><tr key={row.id||i} onClick={()=>onClick?.(row)} tabIndex={onClick?0:undefined} onKeyDown={e=>{if(e.key==='Enter')onClick?.(row)}}>{visible.map(c=><td key={c}>{c==='status'||c==='role'?<Badge value={row[c]}/>:c.includes('_at')||c==='last_seen'?(row[c]?new Date(row[c]).toLocaleString():'—'):Array.isArray(row[c])?row[c].map((v:any)=>typeof v==='object'?JSON.stringify(v):v).join(', '):typeof row[c]==='boolean'?<Badge value={row[c]?'ENABLED':'DISABLED'}/>:typeof row[c]==='object'?<code>{JSON.stringify(row[c])}</code>:String(row[c]??'—')}</td>)}{onClick&&<td><ChevronRight size={16}/></td>}</tr>)}</tbody></table></div>
+ return <div className="tablewrap"><table><thead><tr>{visible.map(c=><th key={c}>{c.replaceAll('_',' ')}</th>)}{onClick&&<th/>}</tr></thead><tbody>{rows.map((row,i)=><tr key={row.id||i} onClick={()=>onClick?.(row)} tabIndex={onClick?0:undefined} onKeyDown={e=>{if(e.key==='Enter')onClick?.(row)}}>{visible.map(c=><td key={c}>{['status','role','service_state','vhost_state'].includes(c)?<Badge value={row[c]}/>:c.includes('_at')||c==='last_seen'?(row[c]?new Date(row[c]).toLocaleString():'—'):Array.isArray(row[c])?row[c].map((v:any)=>typeof v==='object'?JSON.stringify(v):v).join(', '):typeof row[c]==='boolean'?<Badge value={row[c]?'ENABLED':'DISABLED'}/>:typeof row[c]==='object'?<code>{JSON.stringify(row[c])}</code>:String(row[c]??'—')}</td>)}{onClick&&<td><ChevronRight size={16}/></td>}</tr>)}</tbody></table></div>
 }
 
 export function ListField({label,values,onChange,numeric=false,multiline=false,help}:{label:string,values:(string|number)[],onChange:(values:any[])=>void,numeric?:boolean,multiline?:boolean,help?:string}) {

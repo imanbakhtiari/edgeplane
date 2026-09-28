@@ -13,6 +13,7 @@ import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -29,15 +30,36 @@ configure()
 
 @asynccontextmanager
 async def lifespan(app):
+    # Environment values are bootstrap inputs only. Persist them once so later
+    # container recreation cannot discard settings changed through the UI/API.
+    from app.services.dns import import_environment_defaults
+    async with Session.begin() as db:
+        await import_environment_defaults(db)
     yield
     await engine.dispose()
 
 
-app = FastAPI(title="CDN Supervisor", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="CDN Supervisor", version="0.1.0", lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
 app.include_router(auth, prefix="/api/v1")
 app.include_router(resources, prefix="/api/v1")
 app.include_router(operations, prefix="/api/v1")
 app.include_router(analytics, prefix="/api/v1")
+
+
+@app.get("/openapi.json", include_in_schema=False)
+async def protected_openapi(user=Depends(current_user)):
+    return app.openapi()
+
+
+@app.get("/docs", include_in_schema=False)
+async def protected_docs(user=Depends(current_user)):
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="Edgeplane API")
+
+
+@app.get("/redoc", include_in_schema=False)
+async def protected_redoc(user=Depends(current_user)):
+    return get_redoc_html(openapi_url="/openapi.json", title="Edgeplane API")
 
 
 @app.websocket("/api/v1/ws/status")
@@ -68,6 +90,127 @@ async def status_stream(websocket: WebSocket):
             await __import__("asyncio").sleep(2)
     except WebSocketDisconnect:
         return
+
+
+@app.websocket("/api/v1/ws/ssh/{node_id}")
+async def ssh_terminal(websocket: WebSocket, node_id: str):
+    """Authenticated interactive PTY using only the node's approved SSH identity."""
+    import asyncio
+    import secrets
+    from datetime import datetime, timezone
+    from uuid import UUID
+    import asyncssh
+    from sqlalchemy import select
+    from app.api.auth import origin_allowed
+    from app.core.security import token_hash
+    from app.models.entities import AgentNode, AuditLog, LoginSession, User
+    from app.services.provisioning import credential, ssh_options
+
+    if websocket.headers.get("origin") and not origin_allowed(websocket.headers["origin"]):
+        await websocket.close(code=1008, reason="Origin rejected")
+        return
+    raw = websocket.cookies.get("cdn_session", "")
+    async with Session() as db:
+        login = await db.scalar(
+            select(LoginSession).where(
+                LoginSession.token_hash == token_hash(raw),
+                LoginSession.expires_at > datetime.now(timezone.utc),
+            )
+        )
+        user = await db.get(User, login.user_id) if login else None
+        if (
+            not user
+            or not user.active
+            or user.must_change_password
+            or user.role not in {"ADMIN", "OPERATOR"}
+            or not login
+            or not secrets.compare_digest(websocket.query_params.get("csrf", ""), login.csrf)
+        ):
+            await websocket.close(code=1008, reason="Authentication rejected")
+            return
+        try:
+            node = await db.get(AgentNode, UUID(node_id))
+        except ValueError:
+            node = None
+        if not node:
+            await websocket.close(code=1008, reason="Node not found")
+            return
+        ssh_row, ssh_data = await credential(db, node)
+        if not ssh_row.host_key:
+            await websocket.close(code=1008, reason="Approve the SSH host identity first")
+            return
+        host_key = asyncssh.import_public_key(ssh_row.host_key)
+        hostname, username, port = node.hostname, ssh_data["username"], ssh_data["port"]
+        options = ssh_options(ssh_data)
+        db.add(
+            AuditLog(
+                created_by=user.id,
+                action="OPEN_SSH_TERMINAL",
+                resource=str(node.id),
+                source_ip=websocket.client.host if websocket.client else "",
+            )
+        )
+        await db.commit()
+
+    await websocket.accept()
+    try:
+        async with asyncssh.connect(
+            hostname,
+            port=port,
+            username=username,
+            **options,
+            known_hosts=([host_key], [], []),
+            connect_timeout=15,
+        ) as connection:
+            process = await connection.create_process(
+                term_type="xterm-256color", term_size=(120, 32)
+            )
+
+            async def remote_output():
+                while True:
+                    data = await process.stdout.read(4096)
+                    if not data:
+                        break
+                    await websocket.send_json({"type": "output", "data": data})
+
+            async def browser_input():
+                while True:
+                    message = await websocket.receive_json()
+                    if message.get("type") == "input":
+                        process.stdin.write(str(message.get("data", "")))
+                        await process.stdin.drain()
+                    elif message.get("type") == "resize":
+                        cols = max(20, min(400, int(message.get("cols", 120))))
+                        rows = max(5, min(200, int(message.get("rows", 32))))
+                        process.change_terminal_size(cols, rows)
+
+            output_task = asyncio.create_task(remote_output())
+            input_task = asyncio.create_task(browser_input())
+            done, pending = await asyncio.wait(
+                {output_task, input_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if process.exit_status is None:
+                process.stdin.write_eof()
+    except WebSocketDisconnect:
+        return
+    except (asyncssh.Error, OSError, ValueError, asyncio.TimeoutError):
+        try:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": "SSH connection failed. Verify the approved host key, endpoint, and configured credentials.",
+                }
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @app.get("/metrics", tags=["Monitoring"])

@@ -6,6 +6,7 @@ COPY supervisor/frontend/ ./
 RUN npm run build
 FROM python:3.12-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN apt-get update && apt-get install -y --no-install-recommends certbot && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/cdn/supervisor
 COPY supervisor/ ./
 COPY agent/ /opt/cdn/agent/

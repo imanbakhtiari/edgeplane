@@ -38,3 +38,35 @@ WebSocket and real-host acceptance items are tracked in `acceptance.md`.
 The local edge runs real services inside its own container, with no privileged Docker
 flag, host mounts or host network. Internet-facing POPs use the systemd host installer
 and mTLS described in `agent-provisioning.md`.
+
+## Port 443 regression tests
+
+`agent/tests/test_tls_data_plane.py` runs real NGINX and Varnish in an isolated
+container. It binds ports 80/443 only inside that container; do not use host
+networking. The browser-side test client verifies a generated test CA and checks
+which certificate it receives. Cases cover:
+
+- Automatic/no POP certificate: encrypted passthrough and balancing to HTTPS
+  origins, preserving the public SNI and origin certificate.
+- POP TLS termination: HTTP and HTTPS origins, cache MISS/HIT, origin SNI,
+  403 path blocking and 303 redirects on both HTTP and HTTPS.
+- Strict origin verification failure versus explicitly unchecked origin TLS.
+- Rejection of unknown SNI, disabled HTTPS, and HTTP-only origins without a POP
+  certificate. Plain HTTP is not secure, regardless of origin encryption.
+- With `CDN_REAL_COUNTRY_DB` pointing to a GeoLite2 Country MMDB: France blocking
+  after restoring the actual client address through the trusted TLS router.
+
+Build `agent/Dockerfile.edge` and run the agent tests with
+`CDN_REAL_VARNISHD=/usr/sbin/varnishd`; mount the repository at `/repo` and use
+`/repo/agent` as the working directory. Install pytest and pytest-asyncio in that
+disposable container. The stream and headers-more modules must be installed.
+
+Existing hosts need service reprovisioning to install the stream module and
+master stream include. An agent-only upgrade is insufficient; applying TLS
+configuration fails explicitly if the include is missing. Passthrough deliberately
+bypasses HTTP rules and cache; use a valid POP certificate for HTTPS rule enforcement.
+
+Vhost saves now queue a durable, coalesced revision-building job. A successful
+save means queued, not deployed. The worker validates and activates the revision,
+then publishes its acknowledgement to deployment status. Throughput at 100 saves
+per second and 100,000 vhosts has not been benchmarked.

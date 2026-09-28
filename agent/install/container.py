@@ -22,6 +22,7 @@ Path("/etc/nginx/nginx.conf").write_text(
     "worker_rlimit_nofile 262144;\n"
     "pid /run/nginx.pid;\n"
     "events { worker_connections 16384; multi_accept on; use epoll; }\n"
+    "stream { include /tmp/cdn-sandbox/nginx/current/stream/*.conf; }\n"
     "http { sendfile on; tcp_nopush on; tcp_nodelay on; keepalive_timeout 30; "
     "keepalive_requests 10000; reset_timedout_connection on; "
     "include /tmp/cdn-sandbox/nginx/current/http/*.conf; }\n"

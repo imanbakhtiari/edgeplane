@@ -1,6 +1,7 @@
 """SSH is exclusively bootstrap/repair transport. Host key approval is explicit."""
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import shlex
@@ -84,6 +85,23 @@ def ubuntu_release(os_release):
     return version
 
 
+async def upload_mmdb_if_changed(connection, sftp, local_path, remote_name, remote_dir, emit):
+    local = Path(local_path)
+    if not local.is_file():
+        return False
+    with local.open("rb") as file:
+        digest = hashlib.file_digest(file, "sha256").hexdigest()
+    observed = await connection.run(
+        "sha256sum -- " + shlex.quote("/etc/cdn-agent/" + remote_name), check=False
+    )
+    if observed.exit_status == 0 and observed.stdout.split()[:1] == [digest]:
+        await emit(remote_name + " unchanged; upload skipped")
+        return False
+    await emit("Uploading changed " + remote_name)
+    await sftp.put(str(local), remote_dir + "/" + remote_name)
+    return True
+
+
 async def test_ssh(db, node, host_key):
     """Test the exact stored SSH identity and sudo mode without changing the remote host."""
     _row, data = await credential(db, node)
@@ -123,7 +141,46 @@ async def test_ssh(db, node, host_key):
         return {"success": False, "stage": "ssh", "message": "SSH authentication, connection, or host-key verification failed. Check hostname, port, credentials, firewall, and the displayed fingerprint."}
 
 
-async def provision(node, emit):
+MANAGED_SERVICES = frozenset({
+    "nginx", "varnish", "cdn-agent", "prometheus", "prometheus-node-exporter",
+    "prometheus-nginx-exporter", "prometheus-varnish-exporter", "bird",
+})
+
+
+async def service_command(db, node, service, action):
+    """Run one allowlisted diagnostic/action over approved SSH, even if Agent API is down."""
+    if service not in MANAGED_SERVICES or action not in {"logs", "restart"}:
+        raise ValueError("UNSUPPORTED_SERVICE_ACTION")
+    row, data = await credential(db, node)
+    if not row.host_key:
+        raise ValueError("SSH_HOST_KEY_APPROVAL_REQUIRED")
+    key = asyncssh.import_public_key(row.host_key)
+    if action == "logs":
+        command = f"journalctl -u {service} -n 80 --no-pager -o short-iso"
+    elif service == "nginx":
+        command = "nginx -t && nginx -s reload"
+    else:
+        command = f"systemctl restart {service}"
+    sudo_password = data.get("sudo_password") if data.get("sudo_password_required") else None
+    if data["username"] != "root":
+        command = ("sudo -S -p '' -- sh -c " if sudo_password else "sudo -n -- sh -c ") + shlex.quote(command)
+    async with asyncssh.connect(
+        node.hostname, port=data["port"], username=data["username"],
+        **ssh_options(data), known_hosts=([key], [], []), connect_timeout=15,
+    ) as connection:
+        result = await asyncio.wait_for(
+            connection.run(command, input=(sudo_password + "\n") if sudo_password and data["username"] != "root" else None, check=False),
+            timeout=30,
+        )
+    return {
+        "success": result.exit_status == 0,
+        "service": service,
+        "action": "reload" if service == "nginx" and action == "restart" else action,
+        "output": (result.stdout + "\n" + result.stderr)[-16000:],
+    }
+
+
+async def provision(node, emit, agent_only=False, rollback=False):
     async with Session.begin() as db:
         row, data = await credential(db, node)
         if not row.host_key:
@@ -132,6 +189,8 @@ async def provision(node, emit):
         pki = await authority(db)
         identity = issue(pki, str(node.id), urlparse(node.management_url).hostname)
         metrics_identity = issue(pki, "prometheus-" + str(node.id), client=True)
+        from app.services.runtime_settings import get_group
+        geoip = await get_group(db, "geoip")
     await emit("SSH connectivity and approved host fingerprint verification")
     options = ssh_options(data)
     async with asyncssh.connect(
@@ -175,11 +234,12 @@ async def provision(node, emit):
         try:
             async with connection.start_sftp_client() as sftp:
                 await sftp.put(str(package), remote + "/agent", recurse=True)
-                if Path(settings.maxmind_country_db).is_file():
-                    await emit("Uploading supplied MaxMind Country database")
-                    await sftp.put(settings.maxmind_country_db, remote + "/GeoLite2-Country.mmdb")
-                if Path(settings.maxmind_city_db).is_file():
-                    await sftp.put(settings.maxmind_city_db, remote + "/GeoLite2-City.mmdb")
+                if not rollback and geoip["country_enabled"]:
+                    await upload_mmdb_if_changed(connection, sftp, settings.maxmind_country_db,
+                                                 "GeoLite2-Country.mmdb", remote, emit)
+                if not rollback and geoip["city_enabled"]:
+                    await upload_mmdb_if_changed(connection, sftp, settings.maxmind_city_db,
+                                                 "GeoLite2-City.mmdb", remote, emit)
                 config = {
                     "agent_id": str(node.id),
                     "agent_name": node.name,
@@ -202,7 +262,11 @@ async def provision(node, emit):
                 async with sftp.open(remote + "/identity.json", "w") as file:
                     await file.write(json.dumps(config))
                 await sftp.chmod(remote + "/identity.json", 0o600)
-            await emit("Installing packages, services, management identity and controlled NGINX include")
+            await emit(
+                "Upgrading Agent only; NGINX and Varnish will not be changed or signalled"
+                if agent_only
+                else "Installing packages, services, management identity and controlled NGINX include"
+            )
             # Fixed repository installer only; never an Agent shell API. Requires root or NOPASSWD sudo.
             command = (
                 ("" if data["username"] == "root" else "sudo -S -p '' -- ")
@@ -210,6 +274,7 @@ async def provision(node, emit):
                 + shlex.quote(remote + "/agent/install/bootstrap.py")
                 + " "
                 + shlex.quote(remote)
+                + (" --rollback-agent" if rollback else " --agent-only" if agent_only else "")
             )
             process = await connection.create_process(command)
             if data["username"] != "root":
@@ -224,6 +289,10 @@ async def provision(node, emit):
             await process.wait_closed()
             if process.exit_status:
                 raise ValueError("BOOTSTRAP_FAILED")
-            await emit("Agent service installed; verifying management API and full desired state next")
+            await emit(
+                "Agent upgraded; data-plane services were left untouched"
+                if agent_only
+                else "Host services installed; ready for independent desired-state synchronization"
+            )
         finally:
             await connection.run("rm -rf -- " + shlex.quote(remote), check=False)

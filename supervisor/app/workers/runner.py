@@ -15,7 +15,7 @@ from app.db.session import Session, engine
 from app.models import entities as m
 from app.core.settings import settings
 from app.core.security import decrypt, redact
-from app.services.config import latest, enqueue
+from app.services.config import latest, enqueue, revision
 from app.services.agents import request_agent
 
 log = logging.getLogger("cdn.worker")
@@ -45,8 +45,10 @@ def safe_failure(exc):
             return "AGENT_MANAGEMENT_DENIED", "Agent rejected the Supervisor source IP (HTTP 403). Reprovision to refresh its management allowlist, or add the Supervisor egress CIDR to AGENT_MANAGEMENT_ALLOWED_CIDRS."
         return "AGENT_HTTP_ERROR", f"Agent management API returned HTTP {status}. Check the Agent service journal."
     name = type(exc).__name__
-    if name == "ConnectError":
+    if name in {"ConnectError", "ConnectTimeout"}:
         return "AGENT_API_UNREACHABLE", "Cannot connect to the Agent management API. Provision it first, then check port 9443, TLS, and the firewall allowlist."
+    if name == "TimeoutError":
+        return "SSH_CONNECTION_TIMEOUT", "SSH connection timed out. Allow the Supervisor host to reach this POP on TCP 22, then retry the Agent-only upgrade. No NGINX or Varnish process was changed."
     if name in {"ConnectionLost", "ConnectionRefusedError", "HostKeyNotVerifiable", "PermissionDenied"}:
         return "SSH_CONNECTION_FAILED", "SSH connection or authentication failed. Run Test SSH & sudo and check the SSH host, port, credentials, approved fingerprint, and firewall."
     return name, "Operation failed. Run the relevant connectivity test and inspect the provisioning steps below."
@@ -97,22 +99,49 @@ async def perform(target_id):
         job_id = job.id
         kind = job.kind
         payload = job.payload
+        created_by = job.created_by
     await event(job_id, target_id, f"{kind}: starting")
-    if kind == "PROVISION":
+    bootstrap_result = None
+    if kind in {"PROVISION", "SERVICE_SYNC", "AGENT_UPGRADE", "AGENT_ROLLBACK"}:
         from app.services.provisioning import provision
 
-        await provision(node, lambda message: event(job_id, target_id, message))
-        kind = "SYNC"
+        agent_only = kind in {"AGENT_UPGRADE", "AGENT_ROLLBACK"}
+        await provision(
+            node,
+            lambda message: event(job_id, target_id, message),
+            agent_only=agent_only,
+            rollback=kind == "AGENT_ROLLBACK",
+        )
+        bootstrap_result = {"success": True, "agent_only": agent_only}
+        if kind == "PROVISION":
+            await event(job_id, target_id, "Initial host bootstrap complete; synchronizing vhost desired state")
+            kind = "VHOST_SYNC"
+    completed_message = "Completed"
+    if kind in {"SYNC", "VHOST_SYNC", "BUILD_REVISION"}:
+        # Allow rapid API changes to settle before opening a DB transaction,
+        # then read and apply only the newest desired state.
+        await asyncio.sleep(settings.vhost_reconcile_debounce_seconds)
     async with Session.begin() as db:
         node = await db.get(m.AgentNode, node.id) if node else None
-        if kind == "POLL":
+        if kind == "BUILD_REVISION":
+            rev = await revision(db, user_id=created_by, deploy=True)
+            result = {"success": True, "revision": rev.id}
+            completed_message = f"Built desired revision {rev.id}; POP deployment queued"
+        elif kind == "POLL":
             await poll_nodes()
             result = {"success": True}
         elif kind == "DNS":
             from app.services.dns import reconcile
 
             result = await reconcile(db)
-        elif kind in {"SYNC", "VALIDATE"}:
+        elif kind in {"SERVICE_SYNC", "AGENT_UPGRADE", "AGENT_ROLLBACK"}:
+            result = bootstrap_result
+            completed_message = (
+                "Agent release changed without changing or signalling NGINX or Varnish"
+                if kind in {"AGENT_UPGRADE", "AGENT_ROLLBACK"}
+                else "Service desired state reconciled independently of vhost configuration"
+            )
+        elif kind in {"SYNC", "VHOST_SYNC", "VALIDATE"}:
             # Always reconcile newest desired state; old queued work cannot regress a node.
             rev = await latest(db)
             bundle = json.loads(decrypt(rev.encrypted_bundle))
@@ -121,9 +150,13 @@ async def perform(target_id):
                 raise ValueError("AGENT_SCHEMA_UNSUPPORTED")
             await event(job_id, target_id, f"Validating and applying revision {rev.id}")
             result = await request_agent(
-                db, node, "POST", "/api/v1/config/" + ("apply" if kind == "SYNC" else "validate"), bundle
+                db,
+                node,
+                "POST",
+                "/api/v1/config/" + ("validate" if kind == "VALIDATE" else "apply"),
+                bundle,
             )
-            if result.get("success") and kind == "SYNC":
+            if result.get("success") and kind in {"SYNC", "VHOST_SYNC"}:
                 if result.get("revision") != rev.id or result.get("hash") != rev.config_hash:
                     raise ValueError("AGENT_REVISION_HASH_MISMATCH")
                 state = await db.scalar(
@@ -131,7 +164,19 @@ async def perform(target_id):
                 )
                 state.revision = rev.id
                 state.config_hash = rev.config_hash
+                # Commit the acknowledged hashes with the revision. Otherwise list
+                # views keep using the pre-deployment five-minute health sample.
+                health = await db.scalar(select(m.AgentHealthHistory)
+                                         .where(m.AgentHealthHistory.agent_id == node.id)
+                                         .order_by(m.AgentHealthHistory.created_at.desc()).limit(1))
+                observed = dict(health.observed) if health else {}
+                observed.update({key: result[key] for key in ("revision", "hash", "vhosts", "vhost_hashes") if key in result})
+                db.add(m.AgentHealthHistory(agent_id=node.id, observed=observed))
                 node.status = "READY"
+                completed_message = (
+                    f"Desired revision {rev.id} already active; configuration unchanged"
+                    if result.get("noop") else f"Applied desired revision {rev.id} to node"
+                )
         elif kind == "PURGE":
             result = await request_agent(db, node, "POST", "/api/v1/cache/purge", payload)
         elif kind == "RELOAD":
@@ -143,12 +188,16 @@ async def perform(target_id):
         target = await db.get(m.JobTarget, target_id)
         target.status = "SUCCESS" if success else "FAILED"
         target.result = redact(result)
+        if not success and target.agent_id:
+            failed_node = await db.get(m.AgentNode, target.agent_id)
+            failed_node.status = "FAILED"
+    failure_detail = " ".join(str(result.get("stderr", "")).split())[:500]
     await event(
         job_id,
         target_id,
-        "Completed"
+        completed_message
         if success
-        else "CONFIG NOT APPLIED; PREVIOUS CONFIG STILL ACTIVE: " + json.dumps(redact(result)),
+        else "CONFIG NOT APPLIED; PREVIOUS CONFIG STILL ACTIVE: " + str(result.get("error") or result.get("code") or "VALIDATION_FAILED") + (": " + failure_detail if failure_detail else ""),
         "INFO" if success else "ERROR",
     )
 
@@ -233,6 +282,16 @@ async def poll_one(id, semaphore):
                     state.config_hash = observed["hash"]
                     db.add(m.AgentHealthHistory(agent_id=id, observed=observed))
                     desired = await latest(db)
+                    desired_vhost_hashes = {}
+                    if desired:
+                        from app.schemas.config import Bundle
+
+                        desired_bundle = Bundle.model_validate_json(decrypt(desired.encrypted_bundle))
+                        desired_vhost_hashes = {
+                            str(v.id): v.digest() for v in desired_bundle.vhosts if v.enabled
+                        }
+                    observed_vhost_hashes = observed.get("vhost_hashes") or {}
+                    vhosts_drifted = observed_vhost_hashes != desired_vhost_hashes
                     pending = await db.scalar(
                         select(m.JobTarget.id)
                         .where(m.JobTarget.agent_id == id, m.JobTarget.status.in_(["PENDING", "RUNNING"]))
@@ -240,10 +299,28 @@ async def poll_one(id, semaphore):
                     )
                     if (
                         desired
-                        and (state.revision != desired.id or state.config_hash != desired.config_hash)
+                        and (
+                            not healthy
+                            or state.revision != desired.id
+                            or state.config_hash != desired.config_hash
+                            or vhosts_drifted
+                        )
                         and not pending
                     ):
-                        await enqueue(db, "SYNC", node_ids=[id])
+                        await enqueue(
+                            db,
+                            "SERVICE_SYNC" if not healthy else "VHOST_SYNC",
+                            {
+                                "reason": (
+                                    "service-drift"
+                                    if not healthy
+                                    else "vhost-drift"
+                                    if vhosts_drifted
+                                    else "revision-drift"
+                                )
+                            },
+                            node_ids=[id],
+                        )
                 except Exception:
                     node.successes = 0
                     node.failures += 1
@@ -289,9 +366,54 @@ async def poll_nodes():
                 from app.services.dns import reconcile
 
                 await reconcile(db)
+            await renew_certificates()
         finally:
             await connection.execute(text("SELECT pg_advisory_unlock(7391045)"))
             await connection.commit()
+
+
+async def renew_certificates():
+    """Reissue near-expiry Certbot certificates and deploy one new revision."""
+    from datetime import timedelta
+    from app.services.certificates import issue, validate_pair
+    from app.core.security import encrypt
+    from app.services.dns import dns_config
+
+    async with Session.begin() as db:
+        rows = list(
+            (
+                await db.scalars(
+                    select(m.Certificate).where(
+                        m.Certificate.source == "certbot",
+                        m.Certificate.auto_renew.is_(True),
+                        m.Certificate.status == "READY",
+                    )
+                )
+            ).all()
+        )
+        due = [row for row in rows if row.expires_at <= datetime.now(timezone.utc) + timedelta(days=row.renew_before_days)]
+        dns = await dns_config(db)
+        identities = [(row.id, list(row.domains), row.email, row.challenge) for row in due]
+        for row in due:
+            row.status = "RENEWING"
+    changed = False
+    for certificate_id, domains, email, challenge in identities:
+        try:
+            pem, key = await issue(domains, email, dns if challenge == "dns-01" else None, challenge)
+            cert, issued_domains = validate_pair(pem, key)
+            async with Session.begin() as db:
+                row = await db.get(m.Certificate, certificate_id)
+                row.certificate, row.encrypted_key = pem, encrypt(key)
+                row.expires_at, row.domains, row.status = cert.not_valid_after_utc, issued_domains, "READY"
+                changed = True
+        except Exception:
+            async with Session.begin() as db:
+                row = await db.get(m.Certificate, certificate_id)
+                row.status = "FAILED"
+            log.error("automatic certificate renewal failed certificate_id=%s", certificate_id)
+    if changed:
+        async with Session.begin() as db:
+            await revision(db, deploy=True)
 
 
 async def reconciliation_loop():

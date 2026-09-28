@@ -55,7 +55,8 @@ class Origin(Model):
     scheme: Literal["http", "https"] = "http"
     host_header: str | None = None
     sni: str | None = None
-    tls_verify: bool = True
+    # Verification is opt-in because CDN origins are often addressed by IP.
+    tls_verify: bool = False
     weight: int = Field(default=1, ge=1, le=1000)
     backup: bool = False
     max_fails: int = Field(default=3, ge=1, le=100)
@@ -226,6 +227,19 @@ class PathAccessRule(Model):
         return self
 
 
+class RedirectRule(Model):
+    path: str = Field(pattern=r"^/[A-Za-z0-9_/-]{0,255}$")
+    match: Literal["exact", "prefix"] = "exact"
+    target: str = Field(pattern=r"^https?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~/%?=&+-]*)?$", max_length=1024)
+    status: Literal[303] = 303
+
+
+class OriginRoute(Model):
+    path: str = Field(pattern=r"^/[A-Za-z0-9_/.-]{1,255}$")
+    match: Literal["exact", "prefix"] = "prefix"
+    origin_index: int = Field(ge=0, le=15)
+
+
 class AnalyticsPolicy(Model):
     mode: Literal["off", "metrics", "full"] = "full"
     geography: bool = False
@@ -237,6 +251,8 @@ class Vhost(Model):
     geo: GeographicPolicy = Field(default_factory=GeographicPolicy)
     analytics: AnalyticsPolicy = Field(default_factory=AnalyticsPolicy)
     path_rules: list[PathAccessRule] = Field(default_factory=list, max_length=128)
+    redirect_rules: list[RedirectRule] = Field(default_factory=list, max_length=128)
+    origin_routes: list[OriginRoute] = Field(default_factory=list, max_length=128)
     name: str = Field(min_length=1, max_length=100)
     domains: list[str] = Field(min_length=1, max_length=100)
     origins: list[Origin] = Field(min_length=1, max_length=16)
@@ -246,6 +262,8 @@ class Vhost(Model):
     real_ip: RealIPPolicy = Field(default_factory=RealIPPolicy)
     headers: HeaderPolicy = Field(default_factory=HeaderPolicy)
     tls: TLS | None = None
+    tls_mode: Literal["auto", "http_only", "passthrough", "terminate"] = "auto"
+    redirect_https: bool = False
     websocket: bool = True
     logging: bool = True
     max_body_mb: int = Field(default=32, ge=1, le=10240)
@@ -263,6 +281,11 @@ class Vhost(Model):
 
     blocked_paths: list[str] = Field(default_factory=list)
 
+    def digest(self):
+        return hashlib.sha256(
+            json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
     @field_validator("domains")
     @classmethod
     def domains_valid(cls, vs):
@@ -279,6 +302,10 @@ class Vhost(Model):
     @model_validator(mode="after")
     def pool(self):
         first = self.origins[0]
+        if self.tls_mode == "passthrough" and any(o.scheme != "https" for o in self.origins):
+            raise ValueError("TLS passthrough requires HTTPS origins; use POP TLS termination for an HTTP origin")
+        if self.tls_mode in {"passthrough", "http_only"} and self.tls:
+            raise ValueError("A POP certificate requires auto or terminate TLS mode")
         if all(o.backup for o in self.origins):
             raise ValueError("Origin pool requires a primary")
         for o in self.origins:
@@ -289,11 +316,19 @@ class Vhost(Model):
                 first.tls_verify,
             ):
                 raise ValueError("Pool members must share scheme, SNI, Host and TLS verification")
+        if any(route.origin_index >= len(self.origins) for route in self.origin_routes):
+            raise ValueError("Path origin route references an origin that does not exist")
+        routes = [(route.match, route.path) for route in self.origin_routes]
+        if len(routes) != len(set(routes)):
+            raise ValueError("Duplicate path origin route")
         return self
 
 
 class Bundle(Model):
     schema_version: Literal[1, 2] = 2
+    # Bump when templates or rendering semantics change so data-identical
+    # desired state is re-rendered exactly once after an Agent upgrade.
+    renderer_version: int = Field(default=3, ge=1)
     revision: int = Field(ge=1)
     vhosts: list[Vhost] = Field(default_factory=list)
 

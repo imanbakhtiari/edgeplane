@@ -17,8 +17,8 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
-ReadWritePaths=/etc/nginx/cdn-managed /etc/varnish/cdn-managed /var/lib/cdn-agent /var/log/nginx /run
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_KILL CAP_SETUID CAP_SETGID
+ReadWritePaths=/etc/nginx/cdn-managed /etc/varnish/cdn-managed /var/lib/cdn-agent /var/lib/varnish /var/log/nginx /run
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_CHOWN CAP_KILL CAP_SETUID CAP_SETGID
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 [Install]
 WantedBy=multi-user.target

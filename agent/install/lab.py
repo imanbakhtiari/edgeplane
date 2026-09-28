@@ -9,7 +9,7 @@ root = Path("/tmp/cdn-sandbox")
 for name in ["nginx", "varnish", "state", "logs"]:
     (root / name).mkdir(parents=True, exist_ok=True)
 Path("/etc/nginx/nginx.conf").write_text(
-    "include /etc/nginx/modules-enabled/*.conf;\npid /run/nginx.pid;\nevents {}\nhttp { include /tmp/cdn-sandbox/nginx/current/http/*.conf; }\n"
+    "include /etc/nginx/modules-enabled/*.conf;\npid /run/nginx.pid;\nevents {}\nstream { include /tmp/cdn-sandbox/nginx/current/stream/*.conf; }\nhttp { include /tmp/cdn-sandbox/nginx/current/http/*.conf; }\n"
 )
 bootstrap = root / "varnish/bootstrap.vcl"
 bootstrap.write_text('vcl 4.1; backend default { .host="127.0.0.1"; .port="8080"; }\n')

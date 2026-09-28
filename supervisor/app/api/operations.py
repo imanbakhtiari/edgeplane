@@ -169,6 +169,15 @@ async def monitoring(db=Depends(session)):
             .where(m.AgentNode.active.is_(True), m.AgentNode.demo.is_(False))
         )
     ).all()
+    node_ids = [node.id for node, _ in rows]
+    histories = list((await db.scalars(
+        select(m.AgentHealthHistory)
+        .where(m.AgentHealthHistory.agent_id.in_(node_ids))
+        .order_by(m.AgentHealthHistory.created_at.desc())
+    )).all()) if node_ids else []
+    observed_by_node = {}
+    for health in histories:
+        observed_by_node.setdefault(health.agent_id, health.observed)
     agents = [
         {
             "id": n.id,
@@ -179,6 +188,7 @@ async def monitoring(db=Depends(session)):
             "applied_revision": state.revision if state else 0,
             "desired_revision": rev,
             "out_of_sync": not state or state.revision != rev or state.config_hash != hashed,
+            "observed": observed_by_node.get(n.id, {}),
         }
         for n, state in rows
     ]

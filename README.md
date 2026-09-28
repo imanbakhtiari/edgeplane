@@ -1,8 +1,9 @@
 # Edgeplane CDN
 
-A two-application DNS/unicast CDN control plane. **Supervisor** owns desired state
+A two-application CDN control plane. **Supervisor** owns desired state
 in PostgreSQL. The database-free **Agent** manages revisioned NGINX and Varnish
-configuration on each edge. No BGP, Anycast, Redis, or arbitrary shell API.
+configuration on each edge. Optional BIRD/BGP and shared anycast DNS publication
+are available; there is no Redis or arbitrary shell API.
 
 This repository contains the deployable control plane, durable worker, and edge
 agent. Production operation still requires environment-specific capacity testing,
@@ -21,6 +22,8 @@ flowchart TB
   V --> I[Origin NGINX · loopback :8080]
   I --> O[Customer origin pool]
   S --> D[PowerDNS authoritative API]
+  D --> C[Customer CNAME or apex flattening/A records]
+  C --> N
 ```
 
 ## Start the control plane (no demo data)
@@ -89,6 +92,101 @@ NGINX candidate validation precede activation. Every NGINX reload has its own
 immediately preceding successful `nginx -t`. Validation failure restores the old
 pointer and returns failure without reload. Historical rollback creates a new
 revision and restores normalized desired vhost data, rather than editing history.
+
+## Customer traffic and DNS
+
+Edgeplane does **not** edit a customer's authoritative zone when a vhost is created.
+For a subdomain such as `www.customer.example`, the customer replaces that host's
+existing A/AAAA RRset with a CNAME to the assigned hostname in the Edgeplane-managed
+zone. A CNAME cannot coexist with A/AAAA at the same owner name; unrelated hosts'
+A records remain unchanged. For a zone apex such as `customer.example`, use the
+customer DNS provider's ALIAS/ANAME/CNAME-flattening feature, or A/AAAA records to
+stable, actually routed CDN service addresses. Standard apex CNAMEs conflict with
+mandatory SOA/NS data. The application does not provide apex flattening itself.
+
+In **DNS → Shared anycast IPv4/IPv6**, enter only service addresses that are already
+routed to the intended POPs and bound to their data plane. Reconciliation publishes
+them as CDN-hostname A/AAAA answers instead of POP management or SSH addresses.
+When no shared anycast addresses are configured, the reconciler publishes eligible
+healthy POP public unicast addresses instead. BGP announcement and health must be
+verified independently; a DNS A answer alone cannot prove BGP routing. Avoid
+publishing a service address before every intended POP can receive it on port 80/443.
+
+For a safe manual PowerDNS test, open **DNS → Live records**, choose a test name in
+your managed zone (for example `dns-test.edge.example.net`), add or edit its A RRset,
+save, then refresh the list. Check the authoritative answer with
+`dig @<authoritative-server> dns-test.edge.example.net A`. Saving replaces the *whole*
+RRset. Do not use a production CDN hostname for a throwaway test; a future reconcile
+may overwrite application-managed records.
+
+## Per-vhost request policy
+
+- **Geography:** Choose `Only allow selected countries / cities`, enter `IR` for
+  Iran-only access, and decide whether unknown locations should be blocked. This
+  uses MaxMind estimation, not a strong identity or legal geofence.
+- **Access rules:** Deny an exact path/prefix with HTTP 403 or allow only listed
+  client CIDRs. Add a fixed HTTP 303 redirect for an exact path or prefix; use `/`
+  with prefix matching for a whole-vhost redirect. Redirect targets are literal
+  HTTP(S) URLs; original paths and queries are not appended.
+  A path may also route to one explicitly selected origin in the vhost; unmatched
+  paths continue through its normal origin pool. Route prefixes are literal and
+  the vhost's cache and access policies continue to apply.
+- **Cache:** One default cache policy applies to vhosts that have no explicit cache
+  policy selection. A vhost can select another policy; the Agent renders its policy
+  into the Varnish desired-state snapshot.
+- **Policy inheritance:** Cache, rate-limit, Real IP, and header policy collections
+  each have one global default. A vhost with a null policy ID inherits that default;
+  setting the corresponding `*_policy_id` through the API creates a per-vhost
+  override. `GET /api/v1/vhosts` reports `effective_policies`, including its source,
+  name, ID, and resolved configuration.
+- **Rate limiting:** `rate` is sustained requests per second per resolved client IP
+  or configured header value. `burst` is temporary token-bucket capacity, not a ban
+  period. For `rate=200`, `burst=400`, and `nodelay=true`, a short excess burst can
+  pass immediately; later excess requests receive 429 until capacity refills at
+  200 requests/second. There is no five-minute block. Use dry-run before enforcement.
+- **Headers:** Request-policy JSON adds fixed headers to origin requests; response
+  JSON adds headers sent to clients. `debug` emits `X-Served-By` and `X-Request-ID`.
+  Reserved hop-by-hop, credential, and `X-CDN-*` headers are rejected by the schema.
+- **Real IP:** List only trusted proxy CIDRs before using `X-Forwarded-For` (or a
+  selected header). Without a trusted sender, a visitor's supplied XFF is not
+  trusted. `recursive` walks trusted proxy hops. `forward_to_origin` sends the
+  resolved address as `X-Real-IP` and `X-Forwarded-For`; otherwise those two are
+  omitted. `X-Forwarded-Proto` and `X-Request-ID` are sent separately.
+
+Certificates may be uploaded as a manual PEM chain/key pair or issued centrally by
+Certbot using either distributed HTTP-01 through every active POP or PowerDNS DNS-01. HTTP-01 requires each requested domain to resolve to an active POP on port 80. DNS-01 is suitable for anycast and wildcard names because validation does
+not depend on which POP receives an HTTP request. Keys are encrypted in PostgreSQL;
+the selected certificate is included in desired state and terminates TLS on every
+POP. Certbot-managed certificates are reissued before expiry and the renewed desired
+state is synchronized to active nodes. Configure `ACME_DIRECTORY_URL` to Let's
+Encrypt staging while testing, then switch to production after DNS issuance works.
+
+Client TLS and origin TLS are independent:
+
+| Client to POP | POP to origin | Edge certificate | Cache and HTTP policies |
+|---|---|---|---|
+| HTTP | HTTP | not required | enabled |
+| HTTP | HTTPS | not required | enabled |
+| HTTPS | HTTP | required on every serving POP | enabled |
+| HTTPS | HTTPS | required on every serving POP | enabled |
+
+With no selected edge certificate, NGINX intentionally listens only on port 80;
+the origin's certificate cannot be presented to a browser because the browser's TLS
+connection ends at the POP. Origin TLS verification is independently selectable.
+When it is disabled, the POP still encrypts the origin connection and sends the
+configured SNI, but does not validate the origin chain/name. HTTP-to-HTTPS redirect
+is accepted only when an edge certificate is selected. An origin redirect or an HSTS
+policy can still make a browser request HTTPS, so an HTTP-only vhost must not rely on
+an HTTPS redirect. TLS passthrough is deliberately outside this HTTP CDN data plane:
+it would bypass Varnish caching, header policy, path controls and HTTP rate limiting.
+
+Traffic flows through public NGINX, Varnish for cacheable HTTP requests, loopback
+origin NGINX, then the customer origin. WebSockets bypass Varnish. The Agent's
+per-vhost NGINX logs feed traffic counters and optional hourly/country aggregates;
+the Supervisor stores durable rollups in PostgreSQL. POP Prometheus/exporters
+provide service-level metrics. The UI's Traffic and Monitoring pages are not a
+packet-level source of truth; compare them with origin and edge access logs when
+investigating loss or abuse.
 
 ## Operations and deployment
 

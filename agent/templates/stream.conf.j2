@@ -1,0 +1,52 @@
+# TLS is routed by ClientHello SNI without decrypting passthrough traffic.
+{% if terminated or passthrough %}
+map_hash_bucket_size 512;
+map_hash_max_size {{ [2048, (vhosts|map(attribute='domains')|map('length')|sum) * 2]|max }};
+map $ssl_preread_server_name $cdn_tls_target {
+    hostnames;
+    default 127.0.0.1:1;
+{% for v in terminated %}{% for domain in v.domains %}
+    {{ domain }} 127.0.0.1:{{ s.tls_termination_port }};
+{% endfor %}{% endfor %}
+{% for v in passthrough %}{% for domain in v.domains %}
+    {{ domain }} 127.0.0.1:{{ s.tls_passthrough_port }};
+{% endfor %}{% endfor %}
+}
+server {
+    listen {{ s.tls_port }};
+    ssl_preread on;
+    preread_timeout 10s;
+    proxy_connect_timeout 10s;
+    proxy_timeout 300s;
+    proxy_pass $cdn_tls_target;
+    # Preserve the client address for local HTTP TLS termination.
+    proxy_protocol on;
+}
+{% if passthrough %}
+{% for v in passthrough %}
+upstream tls_origin_{{ v.id.hex }} {
+{% for origin, ips in addresses[v.id|string] %}{% for ip in ips %}
+    server {{ '['+ip+']' if ':' in ip else ip }}:{{ origin.port }} weight={{ origin.weight }} max_fails={{ origin.max_fails }} fail_timeout={{ origin.fail_timeout }}s{{ ' backup' if origin.backup else '' }};
+{% endfor %}{% endfor %}
+}
+{% endfor %}
+map $ssl_preread_server_name $cdn_passthrough_target {
+    hostnames;
+    default 127.0.0.1:1;
+{% for v in passthrough %}{% for domain in v.domains %}
+    {{ domain }} tls_origin_{{ v.id.hex }};
+{% endfor %}{% endfor %}
+}
+server {
+    # Consume the router's PROXY header; ordinary HTTPS origins must not receive it.
+    listen 127.0.0.1:{{ s.tls_passthrough_port }} proxy_protocol;
+    ssl_preread on;
+    preread_timeout 10s;
+    proxy_connect_timeout 10s;
+    proxy_timeout 300s;
+    proxy_next_upstream on;
+    proxy_pass $cdn_passthrough_target;
+    proxy_protocol off;
+}
+{% endif %}
+{% endif %}
