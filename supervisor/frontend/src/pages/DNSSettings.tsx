@@ -3,6 +3,7 @@ import {useQuery,useQueryClient} from '@tanstack/react-query';
 import {Plus,RefreshCw,Trash2} from 'lucide-react';
 import {api,type Row} from '../api';
 import {ConfirmDialog,ErrorBox,Field,Help,Modal,Table} from '../components/ui';
+import DNSLua from '../components/DNSLua';
 
 const lines=(value:string)=>value.split('\n').map(v=>v.trim()).filter(Boolean);
 
@@ -26,6 +27,7 @@ export default function DNSSettings({section='records'}:{section?:'records'|'rou
  return <>
   <div className="pagehead"><div className="eyebrow">AUTHORITATIVE DNS</div><h1>{section==='connection'?'DNS connection':section==='routing'?'IP addresses':section==='bgp'?'Subnets & BGP':'DNS records'}</h1><p>DNS publication and network routing are separate operations.</p></div>
   <ErrorBox error={error||settings.error||records.error}/>
+  {section==='routing'&&<DNSLua/>}
   {section==='bgp'&&<section className="panel"><h2>Routing prerequisites</h2><p>Subnet and BGP peer provisioning is not managed by this screen. No routes are announced when DNS settings are saved.</p><ol><li>Allocate an owned or authorized IPv4/IPv6 prefix and service addresses.</li><li>Configure the ASN, upstream peers, export filters and prefix announcements on your routers.</li><li>Verify reachability and established sessions before publishing the service addresses under DNS → IP addresses.</li></ol><a href="/routing-health">Open observed routing health →</a><p>Keep origin addresses separate from CDN service addresses to avoid proxy loops.</p></section>}
   {(section==='connection'||section==='routing')&&<section className="panel">
    {section==='connection'&&<>

@@ -19,6 +19,8 @@ import DNSSettings from './pages/DNSSettings';
 import TerminalDock, {openTerminal} from './components/TerminalDock';
 import OperatorHelp from './components/OperatorHelp';
 import NodeMetrics from './components/NodeMetrics';
+import VarnishSettings from './components/VarnishSettings';
+import VhostWAF from './components/VhostWAF';
 import {Badge,Empty,ErrorBox,Modal,Field,Table,ConfirmDialog,LabelText} from './components/ui';
 const client = new QueryClient({defaultOptions:{queries:{retry:false}}});
 const initialTheme=localStorage.getItem('edgeplane-theme')||'system';
@@ -126,9 +128,9 @@ function SshCredentialFields({cred,setCred}:{cred:Row,setCred:(next:Row)=>void})
 }
 function sshTestMessage(result:Row){return result.success?`SSH connected with ${String(result.auth_mode||'configured').replaceAll('_',' ')} authentication; sudo: ${result.sudo}.`:`${result.stage}: ${result.message}`}
 function VhostForm({initial,close}:{initial?:Row,close:()=>void}) {const [data,setData]=useState<Row>(initial?{...initial,deploy:true}:{...blankHost}),[tab,setTab]=useState('General'),[error,setError]=useState(''),[busy,setBusy]=useState(false),[certCreate,setCertCreate]=useState(false);const policies=useQuery({queryKey:['policies'],queryFn:async()=>Object.fromEntries(await Promise.all(['cache-policies','rate-limit-policies','real-ip-policies','header-policies','certificates'].map(async p=>[p,await api(p.startsWith('/')?p:'/'+p)])))});const set=(k:string,v:any)=>setData({...data,[k]:v});const setCertificate=(id:string|null)=>setData(current=>({...current,certificate_id:id,options:id?{...current.options,tls_mode:'terminate'}:{...current.options,tls_mode:'auto',redirect_https:false}}));const policyTab:Row={'Cache':['cache-policies','cache_policy_id'],'Rate Limiting':['rate-limit-policies','rate_policy_id'],'Real IP':['real-ip-policies','real_ip_policy_id'],'Headers':['header-policies','header_policy_id'],'TLS':['certificates','certificate_id']};async function save(){setBusy(true);try{const payload=Object.fromEntries(['name','domains','origins','enabled','options','cache_policy_id','rate_policy_id','real_ip_policy_id','header_policy_id','certificate_id','customer_id','deploy'].filter(k=>data[k]!==undefined).map(k=>[k,data[k]]));await api('/vhosts'+(initial?'/'+initial.id:''),initial?'PUT':'POST',payload);void client.invalidateQueries();close()}catch(e){setError(String(e))}finally{setBusy(false)}}return <><Modal title={initial?'Edit vhost':'Create vhost'} close={close}>
-<div className="tabs">{['General','Customer','Origin','Cache','Rate Limiting','Real IP','Headers','TLS','Geography','Access rules','Traffic','Logging','Advanced','Review'].map(t=>
+<div className="tabs">{['General','Customer','Origin','Cache','Rate Limiting','Real IP','Headers','TLS','WAF','Geography','Access rules','Traffic','Logging','Advanced','Review'].map(t=>
 <button className={t===tab?'selected':''} key={t} onClick={()=>setTab(t)}>{t}</button>)}</div>
-<div className="formbody">{['Customer','Geography','Access rules','Traffic'].includes(tab)&&<VhostSecurity data={data} set={set} tab={tab}/>}{tab==='General'&&<>
+<div className="formbody">{tab==='WAF'&&<VhostWAF data={data} set={set}/ >}{['Customer','Geography','Access rules','Traffic'].includes(tab)&&<VhostSecurity data={data} set={set} tab={tab}/>}{tab==='General'&&<>
 <Field label="Display name" required value={data.name} onChange={v=>set('name',v)}/>
 <label>Domains · one per line<textarea value={data.domains.join('\n')} onChange={e=>set('domains',e.target.value.split('\n'))}/>
 </label>
@@ -395,6 +397,7 @@ function AgentDetail({row,close}:{row:Row,close:()=>void}) {
 </div>
 <p>Service cards below show component runtime state. Each vhost is compared separately using its desired and currently applied hashes.</p>
 <NodeMetrics observed={node.observed||{}}/>
+<VarnishSettings nodeId={node.id}/>
 <div className="actions node-actions">
 <button onClick={()=>setEditing(true)}>Edit node &amp; SSH</button>
 <button disabled={busy} onClick={discoverSsh}>Discover SSH identity</button>
@@ -456,7 +459,7 @@ function Resource({resource}:{resource:string}) {
  const [params]=useSearchParams();
  useEffect(()=>{const id=params.get('id');if(id&&query.data){const row=query.data.find(r=>r.id===id);if(row)setSelected(row)}},[params,query.data]);
  const rows=(query.data||[]).filter(r=>JSON.stringify(r).toLowerCase().includes(q.toLowerCase()));
- const columns:Record<string,string[]>={agents:['name','city','public_ipv4','active','status','last_seen','services_healthy','services_desired','service_state','vhosts_synced','vhosts_desired','vhost_state'],vhosts:['name','domains','enabled','cdn_hostname'],jobs:['kind','status','created_at'],audit:['action','resource','source_ip','created_at'],dns:['name','type','values','status'],certificates:['name','source','status','domains','auto_renew','expires_at']};
+ const columns:Record<string,string[]>={agents:['name','city','public_ipv4','active','status','last_seen','services_healthy','services_desired','service_state','vhosts_synced','vhosts_desired','vhost_state'],vhosts:['name','domains','enabled','certificate_assigned','https_mode','http_policy_scope','cdn_hostname'],jobs:['kind','status','created_at'],audit:['action','resource','source_ip','created_at'],dns:['name','type','values','status'],certificates:['name','source','status','domains','auto_renew','expires_at']};
  const canCreate=['agents','vhosts','certificates','cache-policies','rate-limit-policies','real-ip-policies','header-policies'].includes(resource);
  async function action(path:string,body?:any){try{await api(path,'POST',body);await client.invalidateQueries();setSelected(null)}catch(e){setError(String(e))}}
  return <>
@@ -486,6 +489,7 @@ function Resource({resource}:{resource:string}) {
  {selected&&(resource==='jobs'?<JobDetail row={selected} close={()=>setSelected(null)}/>:resource==='vhosts'?<Modal title={selected.name} close={()=>setSelected(null)}>
 <div className="formbody">
 <h3>Customer DNS onboarding</h3>
+<p>Desired HTTPS mode: <strong>{selected.https_mode||'Not reported'}</strong> · POP certificate: {selected.certificate_id?'assigned':'not assigned'} · HTTP policy scope: {selected.http_policy_scope||'Not reported'}. Confirm deployment below; assignment alone does not prove a valid certificate is active.</p>
 <code>{selected.domains.join(', ')} → {selected.cdn_hostname}</code>
 <p>Use a CNAME for subdomains. Apex domains require A/AAAA or provider ALIAS/ANAME.</p>
 <VhostDeployment vhost={selected}/>
@@ -628,7 +632,7 @@ function App(){
 <nav>{nav.filter(([,path])=>allowed(path)&&!['/dns/records','/dns/routing','/dns/bgp','/dns/connection','/routing-health','/traffic','/topology','/cache-policies','/rate-limit-policies','/real-ip-policies','/header-policies'].includes(path)).map(([label,path,Icon])=>{
  const link=<NavLink title={label} to={path} end={path==='/'}><Icon size={18}/><span className="nav-label">{label}</span>{path==='/agents'&&!!monitor.data?.out_of_sync&&<span className="nav-count">{monitor.data.out_of_sync}</span>}</NavLink>;
  const children=path==='/monitoring'?['/routing-health','/traffic','/topology']:path==='/vhosts'?['/cache-policies','/rate-limit-policies','/real-ip-policies','/header-policies']:path==='/dns'?['/dns/records','/dns/routing','/dns/bgp','/dns/connection']:[];
- return children.length?<details className="nav-group" key={`${me.id}:${path}`} open><summary><Icon size={18}/><span className="nav-label">{label}</span></summary>{path!=='/dns'&&link}{nav.filter(([,p])=>children.includes(p)&&allowed(p)).map(([l,p,I])=><NavLink key={p} to={p}><I size={16}/><span className="nav-label">{l==='Traffic'?'Traffic & customer monitoring':l}</span></NavLink>)}</details>:<React.Fragment key={path}>{link}</React.Fragment>
+ return children.length?<details className="nav-group" key={`${me.id}:${path}`}><summary><Icon size={18}/><span className="nav-label">{label}</span></summary>{path!=='/dns'&&link}{nav.filter(([,p])=>children.includes(p)&&allowed(p)).map(([l,p,I])=><NavLink key={p} to={p}><I size={16}/><span className="nav-label">{l==='Traffic'?'Traffic & customer monitoring':l}</span></NavLink>)}</details>:<React.Fragment key={path}>{link}</React.Fragment>
 })}</nav>
 <div className="sidebar-tools">
 <button aria-label="Toggle light and dark theme" onClick={()=>savePrefs({theme:document.documentElement.dataset.theme==='dark'?'light':'dark'})}>{document.documentElement.dataset.theme==='dark'?<Sun size={17}/>:<Moon size={17}/>}<span>Appearance</span>

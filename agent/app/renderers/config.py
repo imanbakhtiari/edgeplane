@@ -28,6 +28,8 @@ def vhost_filename(vhost):
 async def render(bundle, settings, release):
     vhosts = sorted([v for v in bundle.vhosts if v.enabled], key=lambda v: str(v.id))
     for v in vhosts:
+        if v.waf.mode != "off" and not v.tls:
+            raise ValueError("WAF_REQUIRES_POP_TLS: passthrough cannot inspect HTTPS")
         if v.tls_mode == "terminate" and not v.tls:
             raise ValueError("POP_TLS_CERTIFICATE_REQUIRED: TLS termination requires a certificate and key")
     terminated = [v for v in vhosts if v.tls and v.tls_mode in {"auto", "terminate"}]
@@ -70,6 +72,9 @@ async def render(bundle, settings, release):
     }
     for v in vhosts:
         files[f"http/{vhost_filename(v)}"] = env.get_template("vhost.conf.j2").render(v=v, **context)
+        if v.waf.mode != "off":
+            from app.services.waf import rules
+            files[f"waf/{v.id}.conf"] = rules(v.waf)
     candidate_temp = settings.state_root / "nginx-candidate"
     files["candidate.conf"] = (
         f"include /etc/nginx/modules-enabled/*.conf;\n"

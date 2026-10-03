@@ -239,6 +239,20 @@ def main():
         rollback_agent_release()
         return
     identity = json.loads((source / "identity.json").read_text())
+    from varnish_config import validate as validate_varnish, logrotate as varnish_logrotate
+    varnish_settings = identity.get("varnish_settings")
+    saved_varnish = Path("/var/lib/cdn-agent/varnish-settings.json")
+    if not varnish_settings and saved_varnish.is_file():
+        varnish_settings = json.loads(saved_varnish.read_text())
+    if varnish_settings:
+        varnish_settings = validate_varnish(varnish_settings)
+    if '--varnish-only' in sys.argv[2:]:
+        from varnish_config import apply
+        if not identity.get("varnish_settings"):
+            raise ValueError("Varnish desired settings missing")
+        result = apply(identity["varnish_settings"])
+        step("Varnish storage and log retention applied; restarted=" + str(result["restarted"]))
+        return
     # Node names are the managed operating-system identity. This is safe during
     # an Agent-only upgrade and does not signal NGINX or Varnish.
     configure_hostname(identity["agent_name"])
@@ -273,7 +287,10 @@ def main():
             source / "agent/systemd/cdn-agent.service",
             "/etc/systemd/system/cdn-agent.service",
         )
-        copy_if_changed(source / "agent/install/logrotate.conf", "/etc/logrotate.d/cdn-agent")
+        if varnish_settings:
+            write("/etc/logrotate.d/cdn-agent", varnish_logrotate(varnish_settings))
+        else:
+            copy_if_changed(source / "agent/install/logrotate.conf", "/etc/logrotate.d/cdn-agent")
         run("systemctl", "daemon-reload")
         run("systemctl", "enable", "cdn-agent")
         activate_agent_release(agent_release)
@@ -285,6 +302,7 @@ def main():
     packages = [
         "nginx",
         "varnish",
+        "logrotate",
         "prometheus-node-exporter",
         "prometheus-nginx-exporter",
         "prometheus-varnish-exporter",
@@ -394,6 +412,7 @@ def main():
     )
     varnish_service_changed = write(
         "/etc/systemd/system/varnish.service.d/cdn.conf",
+        existing_varnish_unit.read_text() if varnish_settings and existing_varnish_unit.is_file() else
         f"[Service]\nExecStart=\nExecStart=/usr/sbin/varnishd -F -a 127.0.0.1:6081 -T 127.0.0.1:6082 -S /etc/varnish/secret -f {active_vcl} -s file,/var/lib/cdn-agent/cache,{size}\n",
     )
     node_exporter_changed = write("/etc/default/prometheus-node-exporter", 'ARGS="--web.listen-address=127.0.0.1:9100"\n')
@@ -477,7 +496,10 @@ def main():
         raise RuntimeError("NGINX VALIDATION FAILED: original configuration restored; no reload")
     step("Installing constrained systemd service")
     copy_if_changed(source / "agent/systemd/cdn-agent.service", "/etc/systemd/system/cdn-agent.service")
-    copy_if_changed(source / "agent/install/logrotate.conf", "/etc/logrotate.d/cdn-agent")
+    if varnish_settings:
+        write("/etc/logrotate.d/cdn-agent", varnish_logrotate(varnish_settings))
+    else:
+        copy_if_changed(source / "agent/install/logrotate.conf", "/etc/logrotate.d/cdn-agent")
     if identity["firewall"]:
         step("Applying opted-in firewall policy, preserving SSH access")
         if not identity["management_cidrs"]:
@@ -514,6 +536,9 @@ def main():
         else:
             step(service + " already active with unchanged configuration; restart skipped")
     # Mandatory independent validation before this bootstrap reload too.
+    if varnish_settings:
+        from varnish_config import apply as apply_varnish
+        apply_varnish(varnish_settings)
     run("nginx", "-t")
     run("systemctl", "enable", "--now", "nginx")
     run("nginx", "-t")

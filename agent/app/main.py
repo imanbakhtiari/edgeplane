@@ -129,6 +129,7 @@ async def ready():
 
 @app.get("/api/v1/capabilities")
 async def capabilities():
+    from app.services.waf import installed
     return {
         "agent_version": "0.1.0",
         "schema_versions": [1, 2],
@@ -144,6 +145,8 @@ async def capabilities():
             "geoip2",
         ],
         "mode": s.agent_mode,
+        "waf_configuration_supported": True,
+        "waf_installation": installed(),
     }
 
 
@@ -249,6 +252,8 @@ async def status():
         "load_percent": os.getloadavg()[0] / cores * 100,
         "network": network_sample(),
         "cache_storage": cache,
+        "varnish_settings": json.loads((s.state_root / "varnish-settings.json").read_text())
+            if (s.state_root / "varnish-settings.json").is_file() else None,
         "cache_error": cache_error,
         "sampled_at": time.time(),
         "services": await services(),

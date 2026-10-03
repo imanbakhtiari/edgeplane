@@ -19,6 +19,7 @@ from app.services.config import POLICIES, configuration_lock, revision, latest, 
 from app.services.agents import request_agent
 from app.core.security import decrypt, encrypt, redact, passwords
 from app.core.settings import settings
+from app.services.tls_status import tls_summary
 
 router = APIRouter(dependencies=[Depends(section_access)])
 writer = role("ADMIN", "OPERATOR")
@@ -563,6 +564,7 @@ class VhostInput(c.Model):
             "analytics",
             "redirect_https",
             "tls_mode",
+            "waf",
         }
         if set(value) - allowed:
             raise ValueError("Options may only contain typed traffic/security settings")
@@ -575,6 +577,9 @@ class VhostInput(c.Model):
 
     @model_validator(mode="after")
     def valid_tls_controls(self):
+        waf = c.WAFPolicy.model_validate(self.options.get("waf", {}))
+        if waf.mode != "off" and not self.certificate_id:
+            raise ValueError("WAF_REQUIRES_POP_CERTIFICATE")
         mode = self.options.get("tls_mode", "auto")
         if mode not in {"auto", "http_only", "passthrough", "terminate"}:
             raise ValueError("Invalid TLS mode")
@@ -651,6 +656,7 @@ async def vhost_output(db, v):
             "config": policy.config if policy else None,
         }
     result["effective_policies"] = effective
+    result.update(tls_summary(v.certificate_id, v.options, result["origins"]))
     return result
 
 
@@ -675,7 +681,8 @@ async def vhosts(
         await db.scalars(select(m.Origin).where(m.Origin.vhost_id.in_(ids)).order_by(m.Origin.position))
     ).all():
         origins.setdefault(row.vhost_id, []).append(row.config)
-    return [{**output(v), "domains": domains.get(v.id, []), "origins": origins.get(v.id, [])} for v in rows]
+    return [{**output(v), "domains": domains.get(v.id, []), "origins": origins.get(v.id, []),
+             **tls_summary(v.certificate_id, v.options, origins.get(v.id, []))} for v in rows]
 
 
 @router.get("/vhosts/{id}/deployment")

@@ -59,6 +59,17 @@ async def test_api_rbac_revisions_jobs_and_immutability():
             )
             assert node.status_code == 200, node.text
             node_id = node.json()["id"]
+            varnish_url = f"/api/v1/agents/{node_id}/varnish"
+            assert (await client.get(varnish_url)).json()["reported"] is None
+            assert (await client.put(varnish_url, json={"storage": "malloc", "size_mb": 512})).status_code == 409
+            changed = await client.put(varnish_url, json={"storage": "malloc", "size_mb": 512,
+                                       "log_retention_days": 14, "acknowledge_restart": True})
+            assert changed.status_code == 200, changed.text
+            assert changed.json()["status"] == "QUEUED"
+            assert (await client.get(varnish_url)).json()["desired"]["size_mb"] == 512
+            async with Session() as db:
+                job = await db.get(m.Job, __import__('uuid').UUID(changed.json()["job_id"]))
+                assert job.kind == "VARNISH_CONFIG"
             edited_node = await client.put(
                 "/api/v1/agents/" + node_id,
                 json={
@@ -81,6 +92,7 @@ async def test_api_rbac_revisions_jobs_and_immutability():
                 },
             )
             assert host.status_code == 200, host.text
+            assert host.json()["https_mode"] == "HTTPS unavailable"
             rev = host.json()["deployment_job_id"]
             assert host.json()["deployment_status"] == "QUEUED"
             policies = await client.get("/api/v1/cache-policies")

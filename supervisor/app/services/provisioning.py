@@ -180,7 +180,7 @@ async def service_command(db, node, service, action):
     }
 
 
-async def provision(node, emit, agent_only=False, rollback=False):
+async def provision(node, emit, agent_only=False, rollback=False, varnish_only=False):
     async with Session.begin() as db:
         row, data = await credential(db, node)
         if not row.host_key:
@@ -191,6 +191,8 @@ async def provision(node, emit, agent_only=False, rollback=False):
         metrics_identity = issue(pki, "prometheus-" + str(node.id), client=True)
         from app.services.runtime_settings import get_group
         geoip = await get_group(db, "geoip")
+        from app.services.varnish import desired
+        varnish_settings = await desired(db, node.id)
     await emit("SSH connectivity and approved host fingerprint verification")
     options = ssh_options(data)
     async with asyncssh.connect(
@@ -234,13 +236,14 @@ async def provision(node, emit, agent_only=False, rollback=False):
         try:
             async with connection.start_sftp_client() as sftp:
                 await sftp.put(str(package), remote + "/agent", recurse=True)
-                if not rollback and geoip["country_enabled"]:
+                if not rollback and not varnish_only and geoip["country_enabled"]:
                     await upload_mmdb_if_changed(connection, sftp, settings.maxmind_country_db,
                                                  "GeoLite2-Country.mmdb", remote, emit)
-                if not rollback and geoip["city_enabled"]:
+                if not rollback and not varnish_only and geoip["city_enabled"]:
                     await upload_mmdb_if_changed(connection, sftp, settings.maxmind_city_db,
                                                  "GeoLite2-City.mmdb", remote, emit)
                 config = {
+                    "varnish_settings": varnish_settings,
                     "agent_id": str(node.id),
                     "agent_name": node.name,
                     "agent_city": node.city,
@@ -263,6 +266,7 @@ async def provision(node, emit, agent_only=False, rollback=False):
                     await file.write(json.dumps(config))
                 await sftp.chmod(remote + "/identity.json", 0o600)
             await emit(
+                "Applying Varnish storage and managed log retention only" if varnish_only else
                 "Upgrading Agent only; NGINX and Varnish will not be changed or signalled"
                 if agent_only
                 else "Installing packages, services, management identity and controlled NGINX include"
@@ -274,7 +278,7 @@ async def provision(node, emit, agent_only=False, rollback=False):
                 + shlex.quote(remote + "/agent/install/bootstrap.py")
                 + " "
                 + shlex.quote(remote)
-                + (" --rollback-agent" if rollback else " --agent-only" if agent_only else "")
+                + (" --varnish-only" if varnish_only else " --rollback-agent" if rollback else " --agent-only" if agent_only else "")
             )
             process = await connection.create_process(command)
             if data["username"] != "root":

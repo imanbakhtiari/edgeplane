@@ -65,6 +65,7 @@ def origin_server(label, cert=None):
             body = json.dumps({"origin": label, "host": self.headers.get("Host"),
                                "sni": getattr(self.connection, "test_sni", None),
                                "client": self.headers.get("X-Real-IP"),
+                               "policy_header": self.headers.get("X-Policy-Test"),
                                "path": self.path}).encode()
             self.send_response(200)
             self.send_header("Cache-Control", "public, max-age=120")
@@ -100,7 +101,8 @@ def request(host, ca, https=True, path="/asset", proxy_source=None, port=None):
                 sock.sendall(f"PROXY TCP4 {proxy_source} 127.0.0.1 50000 443\r\n".encode())
             sock = ssl.create_default_context(cafile=str(ca)).wrap_socket(sock, server_hostname=host)
             peer = sock.getpeercert(binary_form=True)
-        sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+        forwarded = f"X-Forwarded-For: {proxy_source}\r\n" if proxy_source and not https else ""
+        sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\n{forwarded}Connection: close\r\n\r\n".encode())
         response = HTTPResponse(sock)
         response.begin()
         return response.status, dict((k.lower(), v) for k, v in response.getheaders()), response.read(), peer
@@ -129,6 +131,8 @@ async def test_real_443_passthrough_termination_and_origin_protocols(tmp_path):
         http_pop = host("http-pop.example", "http", http_port, tls=tls, tls_mode="terminate")
         http_pop.path_rules = [PathAccessRule(path="/admin/", action="deny")]
         http_pop.redirect_rules = [RedirectRule(path="/mamad/", match="prefix", target="https://other.example/")]
+        http_pop.headers.request = {"X-Policy-Test": "both-listeners"}
+        http_pop.headers.response = {"X-Policy-Response": "both-listeners"}
         https_pop = host("https-pop.example", "https", https_a, tls=tls)
         https_pop.origins[0].sni = "origin.example"
         plain = host("plain.example", "http", http_port)
@@ -148,6 +152,7 @@ async def test_real_443_passthrough_termination_and_origin_protocols(tmp_path):
             settings.maxmind_country_db = Path(os.environ["CDN_REAL_COUNTRY_DB"])
             geo = host("geo.example", "http", http_port, tls=tls)
             geo.geo = GeographicPolicy(mode="deny", countries=["FR"])
+            geo.real_ip.trusted_cidrs = ["127.0.0.1/32"]
             hosts.append(geo)
         release, _ = await deployment.prepare(Bundle(revision=1, vhosts=hosts))
         config = release / "candidate.conf"
@@ -198,6 +203,13 @@ async def test_real_443_passthrough_termination_and_origin_protocols(tmp_path):
                 assert again[1]["x-cache"] == "HIT"
             assert json.loads((await asyncio.to_thread(request, "https-pop.example", ca[2]))[2])["sni"] == "origin.example"
             for https in [False, True]:
+                first = await asyncio.to_thread(request, "http-pop.example", ca[2], https, "/policy-cache")
+                assert first[0] == 200
+                assert first[1]["x-policy-response"] == "both-listeners"
+                assert json.loads(first[2])["policy_header"] == "both-listeners"
+                assert first[1]["x-cache"] == "MISS"
+                cached = await asyncio.to_thread(request, "http-pop.example", ca[2], https, "/policy-cache")
+                assert cached[1]["x-cache"] == "HIT"
                 assert (await asyncio.to_thread(request, "http-pop.example", ca[2], https, "/admin/"))[0] == 403
                 redirected = await asyncio.to_thread(request, "http-pop.example", ca[2], https, "/mamad/hello")
                 assert redirected[0] == 303
@@ -210,6 +222,8 @@ async def test_real_443_passthrough_termination_and_origin_protocols(tmp_path):
                 allowed = await asyncio.to_thread(request, "geo.example", ca[2], True, "/",
                                                   "8.8.8.8", settings.tls_termination_port)
                 assert allowed[0] == 200
+                assert (await asyncio.to_thread(request, "geo.example", ca[2], False, "/", "213.136.80.38"))[0] == 403
+                assert (await asyncio.to_thread(request, "geo.example", ca[2], False, "/", "8.8.8.8"))[0] == 200
 
             # Port 80 remains a cached HTTP proxy, including when its origin uses HTTPS.
             for domain in ["plain.example", "pass.example", "http-pop.example", "https-pop.example"]:

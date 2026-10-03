@@ -19,6 +19,51 @@ admin = role("ADMIN")
 writer = role("ADMIN", "OPERATOR")
 
 
+from app.services.varnish import VarnishSettings, desired as varnish_desired
+from app.services.dns_lua import Policy as LuaPolicy, render as render_lua
+
+
+@router.post("/dns/lua-preview")
+async def lua_preview(body: LuaPolicy, user=Depends(admin)):
+    return render_lua(body)
+
+
+class VarnishChange(VarnishSettings):
+    acknowledge_restart: bool = False
+
+
+@router.get("/agents/{id}/varnish")
+async def varnish_settings(id: UUID, user=Depends(writer), db=Depends(session)):
+    await get(db, m.AgentNode, id)
+    health = await db.scalar(select(m.AgentHealthHistory).where(m.AgentHealthHistory.agent_id == id)
+                            .order_by(m.AgentHealthHistory.created_at.desc()).limit(1))
+    observed = health.observed if health else {}
+    return {"desired": await varnish_desired(db, id),
+            "reported": observed.get("varnish_settings"),
+            "cache_storage": observed.get("cache_storage", []),
+            "reported_at": health.created_at if health else None,
+            "defaults": VarnishSettings().model_dump()}
+
+
+@router.put("/agents/{id}/varnish")
+async def update_varnish(id: UUID, body: VarnishChange, request: Request,
+                         user=Depends(admin), db=Depends(session)):
+    await get(db, m.AgentNode, id)
+    if not body.acknowledge_restart:
+        raise HTTPException(409, "Acknowledge that storage changes restart Varnish and empty its cache")
+    value = body.model_dump(exclude={"acknowledge_restart"})
+    key = f"varnish:{id}"
+    row = await db.scalar(select(m.SystemSetting).where(m.SystemSetting.key == key))
+    if row:
+        row.value = value
+    else:
+        db.add(m.SystemSetting(key=key, value=value))
+    from app.services.config import enqueue
+    job = await enqueue(db, "VARNISH_CONFIG", node_ids=[id], user_id=user.id)
+    audit(db, user, "varnish.configure", id, request)
+    return {"desired": value, "job_id": str(job.id), "status": "QUEUED"}
+
+
 class Preferences(Model):
     theme: Literal["light", "dark", "system"] = "system"
     sidebar_collapsed: bool = False

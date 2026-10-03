@@ -20,7 +20,10 @@ upstream origin_{{ v.id.hex }} {
 {% else %}    listen {{ s.public_port }};
 {% endif %}
     server_name {{ v.domains|join(' ') }};
-{% if v.analytics.mode != 'off' %}
+{% if v.waf.mode != 'off' %}    coraza on;
+    coraza_rules_file {{ release }}/waf/{{ v.id }}.conf;
+    coraza_transaction_id {{ v.id }}-$request_id;
+{% endif %}{% if v.analytics.mode != 'off' %}
     access_log {{ s.log_root }}/metrics/{{ v.id }}.log {{ 'cdn_usage' if v.analytics.geography else 'cdn_usage_plain' }} buffer=64k flush=1s;
 {% endif %}
 {% if v.geo.mode != 'off' %}

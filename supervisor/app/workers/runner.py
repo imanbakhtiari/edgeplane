@@ -102,7 +102,7 @@ async def perform(target_id):
         created_by = job.created_by
     await event(job_id, target_id, f"{kind}: starting")
     bootstrap_result = None
-    if kind in {"PROVISION", "SERVICE_SYNC", "AGENT_UPGRADE", "AGENT_ROLLBACK"}:
+    if kind in {"PROVISION", "SERVICE_SYNC", "AGENT_UPGRADE", "AGENT_ROLLBACK", "VARNISH_CONFIG"}:
         from app.services.provisioning import provision
 
         agent_only = kind in {"AGENT_UPGRADE", "AGENT_ROLLBACK"}
@@ -111,6 +111,7 @@ async def perform(target_id):
             lambda message: event(job_id, target_id, message),
             agent_only=agent_only,
             rollback=kind == "AGENT_ROLLBACK",
+            varnish_only=kind == "VARNISH_CONFIG",
         )
         bootstrap_result = {"success": True, "agent_only": agent_only}
         if kind == "PROVISION":
@@ -134,9 +135,10 @@ async def perform(target_id):
             from app.services.dns import reconcile
 
             result = await reconcile(db)
-        elif kind in {"SERVICE_SYNC", "AGENT_UPGRADE", "AGENT_ROLLBACK"}:
+        elif kind in {"SERVICE_SYNC", "AGENT_UPGRADE", "AGENT_ROLLBACK", "VARNISH_CONFIG"}:
             result = bootstrap_result
             completed_message = (
+                "Varnish storage and managed log retention applied" if kind == "VARNISH_CONFIG" else
                 "Agent release changed without changing or signalling NGINX or Varnish"
                 if kind in {"AGENT_UPGRADE", "AGENT_ROLLBACK"}
                 else "Service desired state reconciled independently of vhost configuration"
@@ -148,6 +150,14 @@ async def perform(target_id):
             capabilities = await request_agent(db, node, "GET", "/api/v1/capabilities")
             if bundle["schema_version"] not in capabilities["schema_versions"]:
                 raise ValueError("AGENT_SCHEMA_UNSUPPORTED")
+            if any("waf" in v for v in bundle.get("vhosts", [])) and not capabilities.get("waf_configuration_supported"):
+                raise ValueError("AGENT_UPGRADE_REQUIRED: this revision includes the WAF configuration schema")
+            for vhost in bundle.get("vhosts", []):
+                waf = vhost.get("waf", {})
+                if vhost.get("enabled", True) and waf.get("mode", "off") != "off":
+                    installation = capabilities.get("waf_installation", {})
+                    if not installation.get("configured") or installation.get("crs_version") != waf.get("crs_version"):
+                        raise ValueError("WAF_CRS_VERSION_NOT_INSTALLED: provision the pinned WAF installation first")
             await event(job_id, target_id, f"Validating and applying revision {rev.id}")
             result = await request_agent(
                 db,

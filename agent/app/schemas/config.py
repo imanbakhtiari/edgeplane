@@ -6,7 +6,7 @@ import json
 import re
 from typing import Literal
 from uuid import UUID
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator, model_serializer
 
 
 def hostname(value: str) -> str:
@@ -245,6 +245,28 @@ class AnalyticsPolicy(Model):
     geography: bool = False
 
 
+class WAFPolicy(Model):
+    mode: Literal["off", "detection", "blocking"] = "off"
+    profile: Literal["low", "standard", "high", "custom"] = "standard"
+    crs_version: str = Field(default="", pattern=r"^(|4\.[0-9]+\.[0-9]+)$")
+    paranoia_level: int = Field(default=1, ge=1, le=4)
+    inbound_threshold: int = Field(default=5, ge=1, le=100)
+    excluded_rule_ids: list[int] = Field(default_factory=list, max_length=128)
+
+    @field_validator("excluded_rule_ids")
+    @classmethod
+    def valid_rule_ids(cls, values):
+        if any(value < 900000 or value > 999999 for value in values):
+            raise ValueError("Only CRS rule IDs 900000–999999 may be excluded")
+        return sorted(set(values))
+
+    @model_validator(mode="after")
+    def pinned_rules(self):
+        if self.mode != "off" and not self.crs_version:
+            raise ValueError("An installed, pinned CRS v4 version is required")
+        return self
+
+
 class Vhost(Model):
     id: UUID
     customer_id: UUID | None = None
@@ -263,6 +285,7 @@ class Vhost(Model):
     headers: HeaderPolicy = Field(default_factory=HeaderPolicy)
     tls: TLS | None = None
     tls_mode: Literal["auto", "http_only", "passthrough", "terminate"] = "auto"
+    waf: WAFPolicy = Field(default_factory=WAFPolicy)
     redirect_https: bool = False
     websocket: bool = True
     logging: bool = True
@@ -280,6 +303,15 @@ class Vhost(Model):
         return [str(ipaddress.ip_network(v, strict=False)) for v in values]
 
     blocked_paths: list[str] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def wire_config(self, handler):
+        data = handler(self)
+        # Preserve existing revision/vhost hashes and compatibility with agents
+        # predating WAF. Enabled policies require explicit capability negotiation.
+        if self.waf.mode == "off":
+            data.pop("waf", None)
+        return data
 
     def digest(self):
         return hashlib.sha256(
