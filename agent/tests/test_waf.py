@@ -60,6 +60,39 @@ def test_invalid_policy(options):
         WAFPolicy(**options)
 
 
+@pytest.mark.parametrize('path', ['/x" deny', '/x\nSecRuleEngine Off', '/x%{TX.a}', '/x\\y', 'admin'])
+def test_path_blocks_reject_rule_injection(path):
+    with pytest.raises(ValidationError):
+        WAFPolicy(path_blocks=[{'path':path}])
+
+
+def test_body_controls_and_virtual_patch_rules(tmp_path):
+    root = tmp_path / 'waf'
+    installation(root)
+    policy = WAFPolicy(mode='blocking',crs_version='4.0.0',request_body=False,
+                       request_body_limit_mb=8,response_body=True,response_body_limit_kb=128,
+                       response_mime_types=['application/json'],
+                       path_blocks=[{'path':'/admin/','match':'prefix','status':403},
+                                    {'path':'/legacy','match':'exact','status':406}])
+    result = rules(policy, root)
+    assert 'SecRequestBodyAccess Off\n' in result
+    assert 'SecRequestBodyLimit 8388608\n' in result
+    assert 'SecResponseBodyAccess On\n' in result
+    assert 'SecResponseBodyLimit 131072\n' in result
+    assert 'SecResponseBodyMimeTypesClear\nSecResponseBodyMimeType application/json\n' in result
+    assert 'REQUEST_FILENAME "@beginsWith /admin/" "id:1100000,phase:1,t:none,deny,status:403' in result
+    assert 'REQUEST_FILENAME "@streq /legacy" "id:1100001,phase:1,t:none,deny,status:406' in result
+    assert result.index('id:1100001') < result.index('/rules/*.conf')
+
+
+@pytest.mark.parametrize('options', [{'request_body_limit_mb':0}, {'response_body_limit_kb':4097},
+                                    {'response_mime_types':['application/json\nSecRuleEngine Off']},
+                                    {'path_blocks':[{'path':'/admin','status':200}]}])
+def test_body_and_action_bounds(options):
+    with pytest.raises(ValidationError):
+        WAFPolicy(**options)
+
+
 async def test_waf_both_listeners_and_vhost_isolation(monkeypatch, tmp_path):
     from app.services import waf
     monkeypatch.setattr(waf, 'rules', lambda policy: 'SecRuleEngine On\n')

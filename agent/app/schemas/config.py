@@ -245,12 +245,24 @@ class AnalyticsPolicy(Model):
     geography: bool = False
 
 
+class WAFPathBlock(Model):
+    path: str = Field(min_length=1, max_length=512, pattern=r"^/[A-Za-z0-9/_.~-]*$")
+    match: Literal["exact", "prefix"] = "prefix"
+    status: Literal[403, 406, 429] = 403
+
+
 class WAFPolicy(Model):
     mode: Literal["off", "detection", "blocking"] = "off"
     profile: Literal["low", "standard", "high", "custom"] = "standard"
     crs_version: str = Field(default="", pattern=r"^(|4\.[0-9]+\.[0-9]+)$")
     paranoia_level: int = Field(default=1, ge=1, le=4)
     inbound_threshold: int = Field(default=5, ge=1, le=100)
+    request_body: bool = True
+    request_body_limit_mb: int = Field(default=32, ge=1, le=128)
+    response_body: bool = False
+    response_body_limit_kb: int = Field(default=512, ge=64, le=4096)
+    response_mime_types: list[Literal["text/plain", "text/html", "text/xml", "application/json", "application/xml"]] = Field(default_factory=lambda: ["text/plain", "text/html"], min_length=1, max_length=5)
+    path_blocks: list[WAFPathBlock] = Field(default_factory=list, max_length=64)
     excluded_rule_ids: list[int] = Field(default_factory=list, max_length=128)
 
     @field_validator("excluded_rule_ids")

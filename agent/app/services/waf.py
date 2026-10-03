@@ -36,13 +36,23 @@ def rules(policy, root=Path("/etc/cdn-agent/waf")):
     crs = root / ("crs-" + policy.crs_version)
     result = [f"Include {root}/coraza-base.conf",
               "SecRuleEngine " + ("On" if policy.mode == "blocking" else "DetectionOnly"),
-              "SecRequestBodyAccess On", "SecRequestBodyLimit 33554432",
+              "SecRequestBodyAccess " + ("On" if policy.request_body else "Off"),
+              f"SecRequestBodyLimit {policy.request_body_limit_mb * 1024 * 1024}",
               "SecRequestBodyLimitAction Reject",
-              "SecResponseBodyAccess Off", "SecAuditEngine Off", "SecDebugLogLevel 0",
+              "SecResponseBodyAccess " + ("On" if policy.response_body else "Off"),
+              f"SecResponseBodyLimit {policy.response_body_limit_kb * 1024}",
+              "SecResponseBodyLimitAction Reject", "SecResponseBodyMimeTypesClear",
+              "SecResponseBodyMimeType " + " ".join(policy.response_mime_types),
+              "SecAuditEngine Off", "SecDebugLogLevel 0",
               'SecDefaultAction "phase:1,pass,log"', 'SecDefaultAction "phase:2,pass,log"',
               f'SecAction "id:900000,phase:1,pass,nolog,setvar:tx.blocking_paranoia_level={level}"',
               f'SecAction "id:900110,phase:1,pass,nolog,setvar:tx.inbound_anomaly_score_threshold={threshold}"',
-              f"Include {crs}/crs-setup.conf", f"Include {crs}/rules/*.conf"]
+              f"Include {crs}/crs-setup.conf"]
+    for index, block in enumerate(policy.path_blocks):
+        operator = "@streq" if block.match == "exact" else "@beginsWith"
+        result.append(f'SecRule REQUEST_FILENAME "{operator} {block.path}" '
+                      f'"id:{1100000 + index},phase:1,t:none,deny,status:{block.status},log,msg:\'Edgeplane path block {index + 1}\'"')
+    result.append(f"Include {crs}/rules/*.conf")
     if policy.excluded_rule_ids:
         result.append("SecRuleRemoveById " + " ".join(map(str, policy.excluded_rule_ids)))
     return "\n".join(result) + "\n"

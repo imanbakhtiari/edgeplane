@@ -146,6 +146,7 @@ async def capabilities():
         ],
         "mode": s.agent_mode,
         "waf_configuration_supported": True,
+        "waf_schema_version": 2,
         "waf_installation": installed(),
     }
 
